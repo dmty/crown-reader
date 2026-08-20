@@ -106,6 +106,13 @@ pub struct CrownBridgeRust {
     focus: f64,
     dropped: i32,
     recording: QString,
+    // Display only: what the raw button should currently read. Outcome
+    // (`Snapshot::raw_enabled`) while a session is active, `raw_requested`
+    // while idle — see `tick()`. Never read by `start()`; `raw_requested`
+    // below is the actual source of truth for what the next session asks
+    // for, so that an active-phase outcome (e.g. `false`, because the
+    // subscribe hasn't happened yet, or the session failed before it could)
+    // can never overwrite what the user asked for.
     raw: bool,
     active: bool,
     ready: bool,
@@ -115,6 +122,13 @@ pub struct CrownBridgeRust {
     recorder: Arc<Mutex<Option<Recorder>>>,
     runtime: Option<tokio::runtime::Runtime>,
     handle: Option<tokio::task::JoinHandle<()>>,
+    // The user's actual pending choice for the *next* session, set only by
+    // `toggle_raw`. This is what `start()` reads — never the `raw` property,
+    // which `tick()` overwrites with the current session's outcome while
+    // active and would otherwise clobber a request the user made before a
+    // session that then failed early (before the raw subscribe was ever
+    // attempted, `Live::raw_enabled` reads as `false`, same as "off").
+    raw_requested: bool,
     // Written by the spawned `supervise` task on a terminal error, read and
     // republished by `tick()` as the `error` property. A separate lock from
     // `live` rather than a new `Live` field: this is GUI presentation state
@@ -150,6 +164,7 @@ impl Default for CrownBridgeRust {
             runtime: None,
             handle: None,
             last_error: Arc::new(Mutex::new(None)),
+            raw_requested: false,
             last_rev: None,
             snapshot: None,
             warned_missing_quality: RefCell::new(HashSet::new()),
@@ -205,7 +220,12 @@ impl qobject::CrownBridge {
         let live = self.live.clone();
         let store = Arc::new(KeyringStore { account: creds.email.clone() });
         let recorder = self.recorder.clone();
-        let raw_enabled = self.raw;
+        // Not `self.raw`: that property can currently be showing this
+        // session's own outcome-in-progress (see the field's doc comment)
+        // rather than the user's request. `raw_requested` is only ever
+        // written by `toggle_raw`, so it survives a session that fails
+        // before ever reaching the point where raw is attempted.
+        let raw_enabled = self.raw_requested;
         let last_error = self.last_error.clone();
         // `supervise` never prints a terminal error itself (see its doc
         // comment) so that there is exactly one place a human sees it; for
@@ -281,10 +301,11 @@ impl qobject::CrownBridge {
         // request: a failed subscribe or the deviceInfo-timeout degrade
         // path (see `ble.rs`) then reads as "Raw: off" instead of a button
         // that keeps claiming success next to a blank waveform. Before a
-        // session starts there is no outcome to report yet, so this leaves
-        // the property alone — it already holds whatever `toggle_raw` last
-        // set, which is the pending choice `main.qml`'s label describes.
-        let raw = if active { snap.raw_enabled } else { *self.raw() };
+        // session starts (or after one ends), this instead republishes
+        // `raw_requested` — never the outcome an *earlier* session may have
+        // just written into this same property, which `start()` correctly
+        // never reads but a human looking at the button still would.
+        let raw = if active { snap.raw_enabled } else { self.raw_requested };
 
         self.as_mut().rust_mut().snapshot = Some(snap);
 
@@ -503,7 +524,12 @@ impl qobject::CrownBridge {
     /// surprise, rather than something a user discovers by watching a flat
     /// trace.
     pub fn toggle_raw(mut self: Pin<&mut Self>) {
-        let next = !*self.raw();
+        // QML only allows this while idle (`enabled: !crown.active`), so
+        // `raw`'s displayed value is already the pending choice here, not
+        // an active session's outcome — but `raw_requested`, not `raw`, is
+        // still the one write that matters: it is what `start()` reads.
+        let next = !self.raw_requested;
+        self.as_mut().rust_mut().raw_requested = next;
         self.as_mut().set_raw(next);
     }
 }
