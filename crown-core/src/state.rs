@@ -76,7 +76,8 @@ impl Live {
     }
 
     pub fn push_raw(&mut self, s: &RawSample) {
-        if s.data.len() != self.rings.len() || self.rings.is_empty() {
+        let aligned = s.data.len() == self.rings.len() && !self.rings.is_empty();
+        if !aligned || s.data.iter().any(|v| !v.is_finite()) {
             self.dropped_frames += 1;
             self.touch();
             return;
@@ -197,5 +198,21 @@ mod tests {
             live.configure(d);
             assert_eq!(live.snapshot(10).waveform.len(), 2);
         }
+    }
+
+    #[test]
+    fn push_raw_drops_a_sample_containing_non_finite_values() {
+        let mut live = Live::new();
+        live.configure(info(2));
+        live.push_raw(&RawSample { timestamp: 1, marker: 0, data: vec![1.0, f64::NAN] });
+        live.push_raw(&RawSample { timestamp: 2, marker: 0, data: vec![f64::INFINITY, 1.0] });
+        live.push_raw(&RawSample { timestamp: 3, marker: 0, data: vec![f64::NEG_INFINITY, 1.0] });
+        let snap = live.snapshot(10);
+        assert_eq!(snap.dropped_frames, 3);
+        assert!(snap.waveform[0].is_empty());
+        assert!(snap.waveform[1].is_empty());
+
+        live.push_raw(&RawSample { timestamp: 4, marker: 0, data: vec![1.0, 2.0] });
+        assert!(!live.snapshot(10).waveform[0].is_empty());
     }
 }

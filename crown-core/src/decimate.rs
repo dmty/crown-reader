@@ -1,6 +1,10 @@
 /// Reduce a sample window to at most `width` (min, max) pairs, one per pixel
 /// column. Min/max rather than stride-sampling so a single-sample artifact
 /// stays visible instead of falling between columns.
+///
+/// Precondition: every sample must be finite. `f32::min`/`max` ignore NaN,
+/// so a non-finite input would silently violate the `lo <= hi` invariant.
+/// `Live::push_raw` enforces this before samples ever reach a ring.
 pub fn decimate(samples: &[f32], width: usize) -> Vec<(f32, f32)> {
     if width == 0 || samples.is_empty() {
         return Vec::new();
