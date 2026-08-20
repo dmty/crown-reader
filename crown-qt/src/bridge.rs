@@ -361,6 +361,18 @@ impl qobject::CrownBridge {
     /// to publish it (see `tick`'s comment) and the one field the transport
     /// clears on a disk-write failure. Writing anywhere else would let the
     /// two disagree.
+    ///
+    /// Ordering rule, same on both paths even though they run it in
+    /// opposite directions: whichever of the two facts (`Live::recording`,
+    /// the `recorder` slot) is made *false* second, and made *true* first,
+    /// is the one a racing transport thread could act on and disagree with.
+    /// So stop clears the private fact (`recorder`) first, then the public
+    /// one (`Live::recording`) — a transport thread that squeezes a write
+    /// in between still writes to a real `Recorder` that's simply about to
+    /// be dropped, harmless. Start publishes the public fact
+    /// (`Live::recording`) first, then installs the private one
+    /// (`recorder`) — see that branch's comment for why the reverse order
+    /// there can latch a lie permanently.
     pub fn toggle_recording(self: Pin<&mut Self>) {
         let mut slot = self.recorder.lock().unwrap();
         if slot.is_some() {
@@ -387,10 +399,25 @@ impl qobject::CrownBridge {
         match Recorder::start(&root, &info, &name) {
             Ok(rec) => {
                 let dir = rec.dir().to_path_buf();
-                *self.recorder.lock().unwrap() = Some(rec);
+                // Publish `Live::recording` *before* installing the
+                // recorder, not after: if the recorder were installed
+                // first, a transport thread could fail its very first
+                // write in the gap before the line below runs, clear the
+                // (already-installed) recorder slot back to `None`, and
+                // call `clear_recording_indicator` — which this line would
+                // then overwrite with `Some(dir)` right afterward. That
+                // indicator would never self-correct, since
+                // `record_raw_samples`/`record_derived_line` only act on a
+                // `Some` slot, and the slot would be `None` from then on.
+                // With `Live::recording` set first, the transport can only
+                // ever observe "recording, no recorder yet" (which it
+                // silently no-ops on) — never "recorder failed, indicator
+                // stuck on".
                 let mut live = self.live.lock().unwrap();
                 live.recording = Some(dir);
                 live.touch();
+                drop(live);
+                *self.recorder.lock().unwrap() = Some(rec);
             }
             Err(e) => eprintln!("crown-qt: failed to start recording: {e}"),
         }
