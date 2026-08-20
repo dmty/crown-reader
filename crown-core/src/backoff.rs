@@ -1,16 +1,15 @@
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use crate::auth::{Credentials, TokenStore};
+use crate::record::Recorder;
+use crate::state::{ConnectionState, Live};
 
 /// 1s, 2s, 4s, 8s, 16s, then 30s forever.
 pub fn backoff_delay(attempt: u32) -> Duration {
     let secs = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
     Duration::from_secs(secs.min(30))
 }
-
-use std::sync::{Arc, Mutex};
-
-use crate::auth::{Credentials, TokenStore};
-use crate::record::Recorder;
-use crate::state::{ConnectionState, Live};
 
 /// Runs the BLE session forever, reconnecting with backoff.
 ///
