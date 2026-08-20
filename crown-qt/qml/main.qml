@@ -25,6 +25,11 @@ ApplicationWindow {
 
     Column {
         id: content
+        // Explicit width, not left to size from children: a Column's
+        // implicit width is the widest child's width, and a child below
+        // binds its own width to `content.width` — leaving this implicit
+        // would close that cycle into a binding loop.
+        width: Math.min(parent.width - 40, 900)
         anchors.centerIn: parent
         spacing: 12
 

@@ -212,6 +212,14 @@ impl qobject::CrownBridge {
     /// two points (min then max), so the zigzag paints a filled-looking trace.
     /// Y is pre-scaled here because QML has no cheap way to map thousands of
     /// points itself.
+    ///
+    /// The scale is shared across every channel (recomputed from
+    /// `s.waveform` on each call), not taken from this channel's own
+    /// min/max: a per-channel scale makes a quiet channel's noise fill the
+    /// height and makes amplitude incomparable between electrodes, which
+    /// defeats the point of a multi-electrode display. One shared scale
+    /// means a loud channel compresses the others instead — the correct
+    /// trade for spotting which electrode looks wrong.
     pub fn waveform(&self, channel: i32, height: f64) -> QList<QPointF> {
         let mut out = QList::<QPointF>::default();
         let Some(s) = &self.snapshot else { return out };
@@ -223,13 +231,27 @@ impl qobject::CrownBridge {
         }
 
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-        for &(min, max) in column {
-            lo = lo.min(min);
-            hi = hi.max(max);
+        for col in &s.waveform {
+            for &(min, max) in col {
+                lo = lo.min(min);
+                hi = hi.max(max);
+            }
         }
-        let span = ((hi - lo) as f64).max(1e-6);
+        // Degenerate when nothing finite was seen (shouldn't happen, since
+        // `column` above is non-empty and is itself part of `s.waveform`)
+        // or every sample across every channel is identical (`hi <= lo`).
+        // Either way there is nothing to scale against, so center the
+        // trace rather than dividing by zero or producing NaN.
+        let span = (hi - lo) as f64;
+        let degenerate = !span.is_finite() || span <= 0.0;
 
-        let map = |v: f32| height - ((v - lo) as f64 / span) * height;
+        let map = |v: f32| -> f64 {
+            if degenerate {
+                height / 2.0
+            } else {
+                height - ((v - lo) as f64 / span) * height
+            }
+        };
         for (x, &(min, max)) in column.iter().enumerate() {
             out.append(QPointF::new(x as f64, map(min)));
             out.append(QPointF::new(x as f64, map(max)));
