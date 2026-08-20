@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crown-core"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+btleplug = "0.12"
+keyring = "4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+uuid = "1"
+futures = "0.3"
+chrono = "0.4"
+anyhow = "1"
