@@ -4,15 +4,8 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::raw::RawSample;
+use crate::state::MAX_CHANNELS;
 use crate::streams::DeviceInfo;
-
-/// Mirrors `state::MAX_CHANNELS`, which is private to that module and so
-/// cannot be shared directly. Keep the two in sync if either changes:
-/// `Recorder::start` must cap the same way `Live::configure` does, or a
-/// `DeviceInfo` claiming more channels than `Live`'s rings will ever emit
-/// produces a header `write_raw`'s width guard then rejects every real
-/// sample against.
-const MAX_CHANNELS: usize = 64;
 
 /// Writes one session to disk: raw samples as CSV, derived metrics as JSON
 /// lines, and a metadata file. Recording is secondary to streaming, so a
