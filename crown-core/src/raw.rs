@@ -26,19 +26,19 @@ impl RawDecoder {
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
         while self.buf.len() >= size {
-            let chunk: Vec<u8> = self.buf.drain(..size).collect();
-            let timestamp = u64::from_be_bytes(chunk[..TIMESTAMP_SIZE].try_into().unwrap());
+            let timestamp = u64::from_be_bytes(self.buf[..TIMESTAMP_SIZE].try_into().unwrap());
             let marker = u16::from_be_bytes(
-                chunk[TIMESTAMP_SIZE..TIMESTAMP_SIZE + MARKER_SIZE].try_into().unwrap(),
+                self.buf[TIMESTAMP_SIZE..TIMESTAMP_SIZE + MARKER_SIZE].try_into().unwrap(),
             );
             let base = TIMESTAMP_SIZE + MARKER_SIZE;
             let data = (0..channels)
                 .map(|i| {
                     let o = base + i * CHANNEL_SIZE;
-                    f64::from_be_bytes(chunk[o..o + CHANNEL_SIZE].try_into().unwrap())
+                    f64::from_be_bytes(self.buf[o..o + CHANNEL_SIZE].try_into().unwrap())
                 })
                 .collect();
             out.push(RawSample { timestamp, marker, data });
+            self.buf.drain(..size);
         }
         out
     }
