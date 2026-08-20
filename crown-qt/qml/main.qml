@@ -17,8 +17,9 @@ ApplicationWindow {
         running: true
         repeat: true
         onTriggered: {
-            crown.tick(content.width);
-            metrics.rev++;
+            if (crown.tick(content.width)) {
+                metrics.rev++;
+            }
         }
     }
 

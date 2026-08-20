@@ -17,9 +17,12 @@ pub mod qobject {
         #[qproperty(i32, dropped)]
         type CrownBridge = super::CrownBridgeRust;
 
-        /// Pulls a snapshot and republishes it as Qt properties.
+        /// Pulls a snapshot and republishes it as Qt properties. Returns
+        /// `true` when it actually refreshed (so QML knows the
+        /// invokable-backed bindings are worth re-evaluating), `false` when
+        /// nothing had changed since the last call.
         #[qinvokable]
-        fn tick(self: Pin<&mut Self>, width: i32);
+        fn tick(self: Pin<&mut Self>, width: i32) -> bool;
 
         /// Starts the BLE supervisor. Safe to call more than once.
         #[qinvokable]
@@ -57,7 +60,10 @@ pub struct CrownBridgeRust {
     live: Arc<Mutex<Live>>,
     runtime: Option<tokio::runtime::Runtime>,
     handle: Option<tokio::task::JoinHandle<()>>,
-    last_rev: u64,
+    // `None` until the first tick, distinct from a real revision (which
+    // starts at 0 too) so the very first call always refreshes rather than
+    // reading as "unchanged" by coincidence.
+    last_rev: Option<u64>,
     snapshot: Option<crown_core::state::Snapshot>,
 }
 
@@ -71,7 +77,7 @@ impl Default for CrownBridgeRust {
             live: Arc::new(Mutex::new(Live::new())),
             runtime: None,
             handle: None,
-            last_rev: 0,
+            last_rev: None,
             snapshot: None,
         }
     }
@@ -131,22 +137,23 @@ impl qobject::CrownBridge {
         self.as_mut().rust_mut().handle = Some(handle);
     }
 
-    pub fn tick(mut self: Pin<&mut Self>, width: i32) {
+    pub fn tick(mut self: Pin<&mut Self>, width: i32) -> bool {
         // Building a Snapshot decimates every channel's ring; skip that
         // work entirely, not just the property writes, when nothing changed.
         let snap = {
             let live = self.live.lock().unwrap();
-            if live.rev() == self.last_rev {
-                return;
+            if self.last_rev == Some(live.rev()) {
+                return false;
             }
             live.snapshot(width.max(0) as usize)
         };
-        self.as_mut().rust_mut().last_rev = snap.rev;
+        self.as_mut().rust_mut().last_rev = Some(snap.rev);
         self.as_mut().set_connection(QString::from(label(snap.connection)));
         self.as_mut().set_calm(snap.calm as f64);
         self.as_mut().set_focus(snap.focus as f64);
         self.as_mut().set_dropped(snap.dropped_frames as i32);
         self.as_mut().rust_mut().snapshot = Some(snap);
+        true
     }
 
     pub fn channels(&self) -> QStringList {

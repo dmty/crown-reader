@@ -69,4 +69,10 @@ ColumnLayout {
             }
         }
     }
+
+    Text {
+        text: "dropped: " + root.bridge.dropped
+        font.pixelSize: 10
+        opacity: 0.4
+    }
 }
