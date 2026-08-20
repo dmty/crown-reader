@@ -43,6 +43,7 @@ pub struct Snapshot {
     pub waveform: Vec<Vec<(f32, f32)>>,
     pub raw_enabled: bool,
     pub dropped_frames: u64,
+    pub raw_samples: u64,
     pub recording: Option<PathBuf>,
     pub rev: u64,
 }
@@ -56,6 +57,7 @@ pub struct Live {
     pub focus: f32,
     pub raw_enabled: bool,
     pub dropped_frames: u64,
+    pub raw_samples: u64,
     pub recording: Option<PathBuf>,
     rings: Vec<ChannelRing>,
     rev: u64,
@@ -72,6 +74,7 @@ impl Live {
             focus: 0.0,
             raw_enabled: false,
             dropped_frames: 0,
+            raw_samples: 0,
             recording: None,
             rings: Vec::new(),
             rev: 0,
@@ -119,6 +122,7 @@ impl Live {
         for (ring, v) in self.rings.iter_mut().zip(&s.data) {
             ring.push(*v as f32);
         }
+        self.raw_samples += 1;
         self.touch();
     }
 
@@ -147,6 +151,7 @@ impl Live {
                 .collect(),
             raw_enabled: self.raw_enabled,
             dropped_frames: self.dropped_frames,
+            raw_samples: self.raw_samples,
             recording: self.recording.clone(),
             rev: self.rev,
         }
@@ -278,6 +283,20 @@ mod tests {
         let before = live.snapshot(10).rev;
         live.push_raw(&RawSample { timestamp: 1, marker: 0, data: vec![1.0, 2.0] });
         assert!(live.snapshot(10).rev > before);
+    }
+
+    #[test]
+    fn raw_samples_counts_accepted_but_not_rejected_frames() {
+        let mut live = Live::new();
+        live.configure(info(2));
+        assert_eq!(live.snapshot(10).raw_samples, 0);
+
+        live.push_raw(&RawSample { timestamp: 1, marker: 0, data: vec![1.0, 2.0] });
+        assert_eq!(live.snapshot(10).raw_samples, 1);
+
+        // Wrong channel count: rejected, must not advance the counter.
+        live.push_raw(&RawSample { timestamp: 2, marker: 0, data: vec![1.0, 2.0, 3.0] });
+        assert_eq!(live.snapshot(10).raw_samples, 1);
     }
 
     #[test]
