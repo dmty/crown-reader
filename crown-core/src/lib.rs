@@ -4,3 +4,4 @@ pub mod raw;
 pub mod decimate;
 pub mod ring;
 pub mod state;
+pub mod auth;
