@@ -117,6 +117,20 @@ fn error_is_terminal(err: &anyhow::Error) -> bool {
 /// reporting that error and exiting non-zero — `supervise` itself does not
 /// print it, so there is exactly one place a human sees the message rather
 /// than two.
+///
+/// The `Adapter` is built once, here, before the loop — not inside `ble::run`
+/// on every attempt. `ble::first_adapter`'s doc comment has the leak this
+/// avoids: btleplug 0.12's CoreBluetooth backend spawns a thread and a
+/// `CBCentralManager` per `Adapter` with no teardown, so building a fresh one
+/// per reconnect leaked both on every retry. Building it here means a
+/// missing/disabled adapter is a hard failure of `supervise` itself rather
+/// than something the backoff loop retries forever — unlike a headset that's
+/// merely off or out of range, there is nothing about waiting 30 more
+/// seconds that makes an adapter appear, and the previous "retry forever"
+/// behavior was incidental to where the code happened to live rather than a
+/// deliberate choice. `Failed` is set the same way the terminal-error branch
+/// below sets it, so a caller watching `Live::connection` sees a consistent
+/// picture regardless of which failure path ended the session.
 pub async fn supervise(
     live: Arc<Mutex<Live>>,
     creds: Credentials,
@@ -124,6 +138,16 @@ pub async fn supervise(
     raw_enabled: bool,
     recorder: Arc<Mutex<Option<Recorder>>>,
 ) -> anyhow::Result<()> {
+    let adapter = match crate::ble::first_adapter().await {
+        Ok(a) => a,
+        Err(e) => {
+            let mut l = crate::sync::lock(&live);
+            l.connection = ConnectionState::Failed;
+            l.touch();
+            return Err(e);
+        }
+    };
+
     let mut attempt = 0u32;
     loop {
         // Credentials deliberately has no Clone (it holds a password); clone
@@ -134,6 +158,7 @@ pub async fn supervise(
             device_id: creds.device_id.clone(),
         };
         let result = crate::ble::run(
+            &adapter,
             live.clone(),
             creds_clone,
             store.clone(),
@@ -143,14 +168,14 @@ pub async fn supervise(
         .await;
 
         if result.as_ref().is_err_and(error_is_terminal) {
-            let mut l = live.lock().unwrap();
+            let mut l = crate::sync::lock(&live);
             l.connection = ConnectionState::Failed;
             l.touch();
             return Err(result.unwrap_err());
         }
 
         let streamed_long_enough = {
-            let l = live.lock().unwrap();
+            let l = crate::sync::lock(&live);
             l.streaming_since.is_some_and(|since| since.elapsed() >= MIN_STREAMING_FOR_RESET)
         };
 
@@ -164,7 +189,7 @@ pub async fn supervise(
         }
 
         {
-            let mut l = live.lock().unwrap();
+            let mut l = crate::sync::lock(&live);
             l.connection = ConnectionState::Reconnecting;
             l.touch();
         }

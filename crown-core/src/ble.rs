@@ -55,10 +55,51 @@ const DEVICE_INFO_TIMEOUT: Duration = Duration::from_secs(15);
 // limitation, not addressed in this round — adding timeouts to every
 // btleplug call is a larger change than fits here.
 
+/// Builds the one `Adapter` a caller should hold for the life of a
+/// reconnecting session, rather than a fresh one per attempt.
+///
+/// `Manager::adapters()` is not free: btleplug 0.12's CoreBluetooth backend
+/// spawns a dedicated thread running `loop { cbi.wait_for_message().await; }`
+/// with no break, so the `CBCentralManager` and the thread backing it live
+/// until the process exits — there is no `Drop` impl that ever tears it
+/// down. Calling this once per `supervise` lifetime (see that function)
+/// instead of once per reconnect attempt is what keeps a headset that's
+/// off or out of range from leaking a thread and a central manager on
+/// every retry.
+pub async fn first_adapter() -> Result<Adapter> {
+    let manager = Manager::new().await?;
+    manager
+        .adapters()
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no Bluetooth adapter available"))
+}
+
 /// Scans for a headset by advertised name. The service UUID is not used as a
 /// scan filter because the device does not reliably advertise it.
+///
+/// Always stops the scan before returning, on every exit path including an
+/// error from `adapter.peripherals()`/`p.properties()` partway through —
+/// best-effort, logged rather than allowed to replace the real result. This
+/// matters more than it used to: `adapter` is now built once per `supervise`
+/// session (see `first_adapter`) and reused across every reconnect attempt,
+/// rather than a fresh, throwaway one per attempt, so a scan left running by
+/// an early return here would carry over into the *next* attempt's
+/// `start_scan` on that same adapter instead of dying with a discarded one.
+/// CoreBluetooth tolerates a redundant `start_scan`, so this was never a
+/// correctness bug — but there is no reason to lean on that tolerance when
+/// stopping cleanly is this cheap.
 pub async fn find_crown(adapter: &Adapter) -> Result<Peripheral> {
     adapter.start_scan(ScanFilter::default()).await?;
+    let result = scan_for_crown(adapter).await;
+    if let Err(e) = adapter.stop_scan().await {
+        eprintln!("warning: failed to stop the Bluetooth scan: {e}");
+    }
+    result
+}
+
+async fn scan_for_crown(adapter: &Adapter) -> Result<Peripheral> {
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(500)).await;
         for p in adapter.peripherals().await? {
@@ -67,12 +108,10 @@ pub async fn find_crown(adapter: &Adapter) -> Result<Peripheral> {
                 None => continue,
             };
             if NAME_PREFIXES.iter().any(|prefix| name.starts_with(prefix)) {
-                adapter.stop_scan().await?;
                 return Ok(p);
             }
         }
     }
-    adapter.stop_scan().await?;
     Err(anyhow!("no Crown or Notion device found within 10 seconds"))
 }
 
@@ -112,7 +151,7 @@ fn apply_json<T: serde::de::DeserializeOwned>(line: &str, apply: impl FnOnce(T))
 /// failure — a disk problem, or `Recorder::write_raw` rejecting a
 /// width-mismatched sample — is not a streaming problem: recording is
 /// secondary to the live connection, so it must not propagate into
-/// `try_run`'s `Result` and tear the session down. It also must not
+/// `stream_session`'s `Result` and tear the session down. It also must not
 /// free-run `eprintln!` at the raw sample rate: neither failure heals
 /// itself sample-to-sample, and at up to ~256 samples/sec a per-sample
 /// warning would itself become a source of loop stalls — the exact hazard
@@ -123,7 +162,7 @@ fn record_raw_samples(recorder: &Mutex<Option<Recorder>>, samples: &[RawSample])
     if samples.is_empty() {
         return false;
     }
-    let mut guard = recorder.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = crate::sync::lock(recorder);
     let Some(r) = guard.as_mut() else { return false };
     for s in samples {
         if let Err(e) = r.write_raw(s) {
@@ -156,7 +195,7 @@ fn record_derived_line(recorder: &Mutex<Option<Recorder>>, uuid: Uuid, line: &st
         CHAR_SIGNAL_QUALITY => "signalQuality",
         _ => return false,
     };
-    let mut guard = recorder.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = crate::sync::lock(recorder);
     let Some(r) = guard.as_mut() else { return false };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return false };
     if let Err(e) = r.write_derived(name, &v) {
@@ -173,7 +212,7 @@ fn record_derived_line(recorder: &Mutex<Option<Recorder>>, uuid: Uuid, line: &st
 /// guard), so this is the only place in the raw/derived recording path
 /// that locks `live` — never nested inside a `recorder` lock.
 fn clear_recording_indicator(live: &Mutex<Live>) {
-    let mut l = live.lock().unwrap();
+    let mut l = crate::sync::lock(live);
     l.recording = None;
     l.touch();
 }
@@ -239,7 +278,7 @@ pub enum AuthOutcome {
 }
 
 /// The device rejected the Bluetooth token twice in a row: once on the
-/// token `try_run` started with, and again after a forced re-mint. A typed
+/// token `stream_session` started with, and again after a forced re-mint. A typed
 /// error rather than a string, so a caller (`supervise`) can classify it as
 /// terminal by type rather than by matching on message text: no amount of
 /// retrying fixes a token the device itself refuses to authenticate twice.
@@ -259,7 +298,7 @@ impl std::error::Error for DeviceRejectedToken {}
 /// The read is bounded by `AUTH_READ_TIMEOUT`: btleplug has no timeout of its
 /// own on a characteristic read (see that constant's doc comment), and
 /// this characteristic is never subscribed, so — unlike the deviceInfo read
-/// this codebase deliberately avoids (see `try_run`) — there is no
+/// this codebase deliberately avoids (see `stream_session`) — there is no
 /// notification stream whose data an abandoned read future could steal.
 pub async fn authenticate(p: &Peripheral, jwt: &str) -> Result<AuthOutcome> {
     let auth = characteristic(p, CHAR_AUTH).await?;
@@ -327,6 +366,10 @@ async fn next_or_disconnected(
 /// scan failure, connect failure, subscribe failure, auth rejection, all of
 /// it — rather than leaving it at whatever the last successful step set.
 ///
+/// `adapter` is built once by the caller (`supervise`) and reused across
+/// every reconnect attempt — see `first_adapter`'s doc comment for why a
+/// fresh one per attempt leaks.
+///
 /// `recorder` starts (and typically stays) `None`; a caller flips it to
 /// `Some` to turn recording on mid-session and back to `None` to turn it
 /// off, without needing to restart the connection. This is stronger than a
@@ -339,6 +382,7 @@ async fn next_or_disconnected(
 /// a cycle, because there is no window in which this code holds one while
 /// waiting on the other. Neither lock is ever held across an `.await`.
 pub async fn run(
+    adapter: &Adapter,
     live: Arc<Mutex<Live>>,
     creds: Credentials,
     store: Arc<dyn TokenStore>,
@@ -346,9 +390,9 @@ pub async fn run(
     recorder: Arc<Mutex<Option<Recorder>>>,
 ) -> Result<()> {
     let live_for_failure = live.clone();
-    let result = try_run(live, creds, store, raw_enabled, recorder).await;
+    let result = try_run(adapter, live, creds, store, raw_enabled, recorder).await;
     if result.is_err() {
-        let mut l = live_for_failure.lock().unwrap();
+        let mut l = crate::sync::lock(&live_for_failure);
         l.connection = ConnectionState::Failed;
         l.touch();
     }
@@ -356,26 +400,36 @@ pub async fn run(
 }
 
 async fn try_run(
+    adapter: &Adapter,
     live: Arc<Mutex<Live>>,
     creds: Credentials,
     store: Arc<dyn TokenStore>,
     raw_enabled: bool,
     recorder: Arc<Mutex<Option<Recorder>>>,
 ) -> Result<()> {
-    // `streaming_since` is managed here, alongside `connection`, rather than
-    // by the caller: `Scanning` marks the start of a fresh attempt and
-    // clears any timestamp left over from a previous run on this same
-    // `Live` (it is not recreated per attempt), and `Streaming` is the one
-    // transition that stamps it. Every other state (`Connecting`,
-    // `Authenticating`, `Disconnected`) leaves it alone — in particular,
-    // `Disconnected` must not clear it, since a caller reading `Live` after
-    // `run()` returns (to measure how long the session actually streamed)
-    // needs it to still be there.
+    // `streaming_since` and `raw_enabled` are managed here, alongside
+    // `connection`, rather than by the caller: `Scanning` marks the start of
+    // a fresh attempt and clears state left over from a previous run on this
+    // same `Live` (it is not recreated per attempt) — `streaming_since` back
+    // to `None`, `raw_enabled` back to `false` — and the rest of this
+    // function only ever sets each back to something truthful for *this*
+    // attempt. Without the `raw_enabled` reset, a reconnect whose raw
+    // subscribe fails (or that never reaches the point where raw is
+    // attempted at all) would keep publishing the previous attempt's success
+    // instead of this attempt's failure. `Streaming` is the one transition
+    // that stamps `streaming_since`. Every other state (`Connecting`,
+    // `Authenticating`, `Disconnected`) leaves both alone — in particular,
+    // `Disconnected` must not clear `streaming_since`, since a caller reading
+    // `Live` after `run()` returns (to measure how long the session actually
+    // streamed) needs it to still be there.
     let set = |s: ConnectionState| {
-        let mut l = live.lock().unwrap();
+        let mut l = crate::sync::lock(&live);
         l.connection = s;
         match s {
-            ConnectionState::Scanning => l.streaming_since = None,
+            ConnectionState::Scanning => {
+                l.streaming_since = None;
+                l.raw_enabled = false;
+            }
             ConnectionState::Streaming => l.streaming_since = Some(Instant::now()),
             _ => {}
         }
@@ -383,15 +437,43 @@ async fn try_run(
     };
 
     set(ConnectionState::Scanning);
-    let manager = Manager::new().await?;
-    let adapter = manager
-        .adapters()
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("no Bluetooth adapter available"))?;
-    let peripheral = find_crown(&adapter).await?;
+    let peripheral = find_crown(adapter).await?;
 
+    // Every exit from here down — a clean disconnect, an error partway
+    // through, or the terminal double-rejection path alike — must release
+    // the link: the Crown accepts only one connection at a time, and
+    // btleplug 0.12's CoreBluetooth backend has no `Drop` impl on
+    // `Peripheral` to do this automatically (see `first_adapter`'s doc
+    // comment for the adapter side of the same class of leak). Best-effort:
+    // a disconnect failure is logged and never allowed to replace the real
+    // result from `stream_session` — `run`'s caller needs that result to
+    // classify the failure and decide whether to retry.
+    let result =
+        stream_session(&peripheral, live.clone(), creds, store, raw_enabled, recorder, &set)
+            .await;
+    if let Err(e) = peripheral.disconnect().await {
+        eprintln!("warning: failed to disconnect from the headset: {e}");
+    }
+    result
+}
+
+/// Authenticates, subscribes, and pumps notifications from an already-found
+/// `peripheral` into `live` until the connection drops. Split out of
+/// `try_run` so that its caller can guarantee `peripheral.disconnect()` runs
+/// no matter which way this returns.
+async fn stream_session(
+    peripheral: &Peripheral,
+    live: Arc<Mutex<Live>>,
+    creds: Credentials,
+    store: Arc<dyn TokenStore>,
+    raw_enabled: bool,
+    recorder: Arc<Mutex<Option<Recorder>>>,
+    // `Send + Sync` on the trait object, not just the underlying closure: a
+    // bare `dyn Fn(ConnectionState)` erases that the closure only captures a
+    // `&Arc<Mutex<Live>>` (itself `Send + Sync`), which would otherwise make
+    // this whole future `!Send` and reject it at `tokio::spawn`.
+    set: &(dyn Fn(ConnectionState) + Send + Sync),
+) -> Result<()> {
     set(ConnectionState::Connecting);
     peripheral.connect().await?;
     peripheral.discover_services().await?;
@@ -400,7 +482,7 @@ async fn try_run(
     let mut jwt = token(&creds, store.as_ref(), false).await?;
     let mut retried = false;
     loop {
-        match authenticate(&peripheral, &jwt).await? {
+        match authenticate(peripheral, &jwt).await? {
             AuthOutcome::Accepted(_) => break,
             AuthOutcome::NoAnswer => {
                 // Not a rejection: the cached token may be fine and the
@@ -466,7 +548,7 @@ async fn try_run(
     // cancelled wait loses nothing already queued in it, which is what makes
     // wrapping the drain below in a timeout safe where wrapping the read
     // was not.
-    let device_info_char = characteristic(&peripheral, CHAR_DEVICE_INFO).await?;
+    let device_info_char = characteristic(peripheral, CHAR_DEVICE_INFO).await?;
     let mut stitchers: std::collections::HashMap<Uuid, Stitcher> = Default::default();
 
     peripheral.subscribe(&device_info_char).await?;
@@ -474,7 +556,7 @@ async fn try_run(
         let mut configured = false;
         while !configured {
             let Some(n) =
-                next_or_disconnected(&mut notifications, &peripheral, &mut liveness).await
+                next_or_disconnected(&mut notifications, peripheral, &mut liveness).await
             else {
                 return None; // disconnected before deviceInfo ever arrived
             };
@@ -482,7 +564,7 @@ async fn try_run(
                 continue;
             }
             for line in stitchers.entry(n.uuid).or_default().push(&n.value) {
-                let mut l = live.lock().unwrap();
+                let mut l = crate::sync::lock(&live);
                 let parsed = apply_json(&line, |d: DeviceInfo| l.configure(d));
                 configured = l.device.is_some();
                 if !parsed {
@@ -512,7 +594,7 @@ async fn try_run(
             // CLI sees `channels=0` (and, with `--raw`, `cols=0
             // ch0_extent=[no data yet]`) hold forever instead of populating,
             // alongside this one-off bump in `dropped_frames`.
-            let mut l = live.lock().unwrap();
+            let mut l = crate::sync::lock(&live);
             l.dropped_frames += 1;
             l.touch();
             false
@@ -520,16 +602,18 @@ async fn try_run(
     };
 
     for uuid in [CHAR_POWER_BY_BAND, CHAR_CALM, CHAR_FOCUS, CHAR_SIGNAL_QUALITY] {
-        peripheral.subscribe(&characteristic(&peripheral, uuid).await?).await?;
+        peripheral.subscribe(&characteristic(peripheral, uuid).await?).await?;
     }
 
     // Raw is opportunistic: a device without the characteristic, or a
     // subscribe that fails for any other reason, just leaves raw off rather
     // than tearing down an otherwise healthy session. `Live::raw_enabled`
-    // staying false is itself the visible record of that — there is no
-    // logging dependency in this workspace. Also skipped outright if
-    // deviceInfo never configured `Live`: there is no channel count to
-    // decode raw bytes against.
+    // is the actual outcome of that attempt, not a record of intent — the
+    // bridge's `tick()` republishes it as the `raw` property while a session
+    // is active precisely so a failed subscribe here is visible in the UI
+    // instead of hiding behind a button still showing the user's original
+    // request. Also skipped outright if deviceInfo never configured `Live`:
+    // there is no channel count to decode raw bytes against.
     //
     // Subscribed last, immediately before we start draining the stream: raw
     // is the one characteristic where an evicted notification can't self-heal
@@ -537,11 +621,11 @@ async fn try_run(
     // between "notifications can arrive" and "something is reading them" has
     // to be kept as close to zero as it can be.
     if raw_enabled && device_info_configured {
-        let subscribed = match characteristic(&peripheral, CHAR_RAW).await {
+        let subscribed = match characteristic(peripheral, CHAR_RAW).await {
             Ok(raw_char) => peripheral.subscribe(&raw_char).await.is_ok(),
             Err(_) => false,
         };
-        let mut l = live.lock().unwrap();
+        let mut l = crate::sync::lock(&live);
         l.raw_enabled = subscribed;
         l.touch();
     }
@@ -560,14 +644,14 @@ async fn try_run(
     let mut raw_decoder = RawDecoder::default();
 
     loop {
-        let Some(n) = next_or_disconnected(&mut notifications, &peripheral, &mut liveness).await
+        let Some(n) = next_or_disconnected(&mut notifications, peripheral, &mut liveness).await
         else {
             break;
         };
 
         if n.uuid == CHAR_RAW {
             let channels = {
-                let l = live.lock().unwrap();
+                let l = crate::sync::lock(&live);
                 l.device.as_ref().map(|d| d.channels).unwrap_or(0)
             };
             if channels == 0 {
@@ -577,7 +661,7 @@ async fn try_run(
             }
             let samples = raw_decoder.push(&n.value, channels);
             {
-                let mut l = live.lock().unwrap();
+                let mut l = crate::sync::lock(&live);
                 for s in &samples {
                     l.push_raw(s);
                 }
@@ -590,7 +674,7 @@ async fn try_run(
 
         for line in stitchers.entry(n.uuid).or_default().push(&n.value) {
             let parsed = {
-                let mut l = live.lock().unwrap();
+                let mut l = crate::sync::lock(&live);
                 let parsed = match n.uuid {
                     CHAR_DEVICE_INFO => apply_json(&line, |d: DeviceInfo| l.configure(d)),
                     CHAR_POWER_BY_BAND => apply_json(&line, |b: PowerByBand| {
