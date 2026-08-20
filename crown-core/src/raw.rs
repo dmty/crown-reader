@@ -18,10 +18,21 @@ pub struct RawSample {
 #[derive(Default)]
 pub struct RawDecoder {
     buf: Vec<u8>,
+    channels: Option<usize>,
 }
 
 impl RawDecoder {
+    /// Decodes big-endian samples from the byte stream.
+    ///
+    /// `channels` must not change for a decoder's lifetime. If the channel count changes,
+    /// clear the decoder with a fresh `RawDecoder::default()` to reconnect.
     pub fn push(&mut self, bytes: &[u8], channels: usize) -> Vec<RawSample> {
+        if let Some(prev_channels) = self.channels {
+            if prev_channels != channels {
+                self.buf.clear();
+            }
+        }
+        self.channels = Some(channels);
         let size = encoded_sample_size(channels);
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
@@ -93,5 +104,20 @@ mod tests {
         let out = d.push(&bytes, 1);
         assert_eq!(out.len(), 3);
         assert_eq!(out[2].timestamp, 3);
+    }
+
+    #[test]
+    fn changing_channel_count_discards_stranded_bytes() {
+        let mut d = RawDecoder::default();
+        let bytes_2ch = encode(42, 0, &[1.0, 2.0]);
+        // Push only the first 20 bytes of a 2-channel sample (26 bytes total)
+        assert!(d.push(&bytes_2ch[..20], 2).is_empty());
+        // Now change to 1-channel and push a complete 1-channel sample
+        let bytes_1ch = encode(99, 0, &[3.0]);
+        let out = d.push(&bytes_1ch, 1);
+        // Should get exactly one sample with the 1-channel data, proving stranded bytes were discarded
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].timestamp, 99);
+        assert_eq!(out[0].data, vec![3.0]);
     }
 }
