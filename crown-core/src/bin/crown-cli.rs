@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crown_core::auth::{Credentials, KeyringStore};
-use crown_core::ble;
+use crown_core::backoff;
 use crown_core::state::Live;
 
 #[tokio::main]
@@ -24,7 +24,10 @@ async fn main() {
     let worker = tokio::spawn({
         let live = live.clone();
         let store = store.clone();
-        async move { ble::run(live, creds, store, raw_enabled, recorder).await }
+        async move {
+            backoff::supervise(live, creds, store, raw_enabled, recorder).await;
+            Ok::<(), anyhow::Error>(())
+        }
     });
 
     let started = Instant::now();
