@@ -12,10 +12,11 @@ impl Stitcher {
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
         while let Some(i) = self.buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=i).collect();
-            if let Ok(s) = std::str::from_utf8(&line[..line.len() - 1]) {
-                if !s.is_empty() {
-                    out.push(s.to_string());
+            if let Ok(text) = std::str::from_utf8(&self.buf[..i]) {
+                let text = text.to_string();
+                self.buf.drain(..=i);
+                if !text.is_empty() {
+                    out.push(text);
                 }
             }
         }
