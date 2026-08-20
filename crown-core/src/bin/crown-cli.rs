@@ -24,10 +24,7 @@ async fn main() {
     let worker = tokio::spawn({
         let live = live.clone();
         let store = store.clone();
-        async move {
-            backoff::supervise(live, creds, store, raw_enabled, recorder).await;
-            Ok::<(), anyhow::Error>(())
-        }
+        async move { backoff::supervise(live, creds, store, raw_enabled, recorder).await }
     });
 
     let started = Instant::now();
