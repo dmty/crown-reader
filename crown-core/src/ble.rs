@@ -25,6 +25,24 @@ pub const CHAR_SIGNAL_QUALITY: Uuid = Uuid::from_u128(0xcf28ed0c_20cd_48ed_93c5_
 
 const NAME_PREFIXES: [&str; 2] = ["Crown-", "Notion-"];
 
+/// btleplug's CoreBluetooth backend resolves a characteristic read's
+/// underlying future only from a `didUpdateValueForCharacteristic` callback
+/// or a disconnect sweep — there is no timeout inside btleplug itself, so a
+/// read that never gets acknowledged hangs forever without one of these.
+/// Two separate bounds below guard two different things, deliberately not
+/// shared: one is a request/response round trip, the other is "wait for the
+/// device to volunteer its identity blob" on a link that was just
+/// authenticated and may still be settling its notify pipeline.
+///
+/// Bound on the auth characteristic's read reply.
+const AUTH_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on the wait for the one-shot deviceInfo notification after
+/// subscribing to it. Longer than `AUTH_READ_TIMEOUT`: firing this early on
+/// a device that's simply slow to start notifying turns a working headset
+/// into a silently raw-less session, which is a worse failure mode than
+/// waiting a few extra seconds.
+const DEVICE_INFO_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Scans for a headset by advertised name. The service UUID is not used as a
 /// scan filter because the device does not reliably advertise it.
 pub async fn find_crown(adapter: &Adapter) -> Result<Peripheral> {
@@ -67,14 +85,6 @@ fn apply_json<T: serde::de::DeserializeOwned>(line: &str, apply: impl FnOnce(T))
         }
         Err(_) => false,
     }
-}
-
-/// A direct characteristic read returns one complete value, not a notify
-/// fragment, so it bypasses the newline-delimited `Stitcher` used for the
-/// subscribed stream and is parsed directly instead.
-fn parse_direct_read(bytes: &[u8]) -> Option<DeviceInfo> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    serde_json::from_str(text.trim()).ok()
 }
 
 /// Writes `jwt` to the auth characteristic.
@@ -121,10 +131,22 @@ async fn write_jwt(p: &Peripheral, auth: &btleplug::api::Characteristic, jwt: &s
 }
 
 /// Writes the minted JWT and reads back `[isAuthenticated, expiresIn]`.
+///
+/// The read is bounded by `AUTH_READ_TIMEOUT`: btleplug has no timeout of its
+/// own on a characteristic read (see that constant's doc comment), and
+/// this characteristic is never subscribed, so — unlike the deviceInfo read
+/// this codebase deliberately avoids (see `try_run`) — there is no
+/// notification stream whose data an abandoned read future could steal. A
+/// timeout here is converted to `ok = false` rather than an error, so it
+/// flows through the caller's existing mint-once-more-then-fail retry
+/// instead of surfacing as a different kind of failure.
 pub async fn authenticate(p: &Peripheral, jwt: &str) -> Result<(bool, Option<f64>)> {
     let auth = characteristic(p, CHAR_AUTH).await?;
     write_jwt(p, &auth, jwt).await?;
-    let raw = p.read(&auth).await?;
+    let raw = match tokio::time::timeout(AUTH_READ_TIMEOUT, p.read(&auth)).await {
+        Ok(read) => read?,
+        Err(_) => return Ok((false, None)),
+    };
     let parsed: serde_json::Value = serde_json::from_slice(&raw)?;
     let ok = parsed
         .get(0)
@@ -252,53 +274,87 @@ async fn try_run(
 
     // deviceInfo gates everything else: raw has no delimiter or checksum, so
     // decoding it needs the channel count from deviceInfo first, and every
-    // per-channel structure in `Live` is sized from it too. It is resolved
-    // completely — by direct read if possible, otherwise by subscribing to
-    // it alone and waiting — before any other characteristic is subscribed.
-    // That ordering matters: btleplug buffers at most 16 notifications and
-    // silently discards the oldest past that (a lagged read is dropped, not
-    // surfaced), so subscribing the other four characteristics first — any
-    // of which can emit before anything drains the buffer — risks evicting
-    // the one-shot deviceInfo notification before it is ever read, wedging
-    // raw off for the life of the connection with nothing to show why.
+    // per-channel structure in `Live` is sized from it too. It is resolved by
+    // subscribing to it alone and waiting, before any other characteristic
+    // is subscribed. That ordering matters: btleplug buffers at most 16
+    // notifications and silently discards the oldest past that (a lagged
+    // notification is dropped, not surfaced), so subscribing the other four
+    // characteristics first — any of which can emit before anything drains
+    // the buffer — risks evicting the one-shot deviceInfo notification
+    // before it is ever read.
+    //
+    // A direct `read()` on this characteristic looks like the obvious way to
+    // sidestep that race — an earlier version of this function did exactly
+    // that — but it does not work on btleplug 0.12's CoreBluetooth backend.
+    // Reads and notifications share one delegate callback there
+    // (`on_characteristic_read`'s own source comment: "Reads and
+    // notifications both return the same callback"), matched to whichever
+    // read future is oldest in a per-characteristic queue, not to the
+    // specific request that produced the value. A read that is never
+    // acknowledged — not readable, or the callback simply never fires —
+    // leaves its future queued forever with no timeout inside btleplug to
+    // end it, and wrapping it in `tokio::time::timeout` does not help:
+    // dropping our side of the future does not deregister it from that
+    // queue, so the *next* real deviceInfo notification gets popped off the
+    // queue and used to fulfill the abandoned read instead of ever reaching
+    // us as a notification — silently, since nothing is awaiting that read
+    // any more. Subscribing and draining the notification stream has no
+    // equivalent hazard: `StreamExt::next` only borrows the stream, so a
+    // cancelled wait loses nothing already queued in it, which is what makes
+    // wrapping the drain below in a timeout safe where wrapping the read
+    // was not.
     let device_info_char = characteristic(&peripheral, CHAR_DEVICE_INFO).await?;
     let mut stitchers: std::collections::HashMap<Uuid, Stitcher> = Default::default();
 
-    // A direct read sidesteps the eviction race entirely, so try it first.
-    // Not every characteristic is readable — a failure here just falls
-    // through to the subscribe-and-wait path below.
-    let mut device_info_configured = match peripheral.read(&device_info_char).await {
-        Ok(bytes) => match parse_direct_read(&bytes) {
-            Some(info) => {
-                let mut l = live.lock().unwrap();
-                l.configure(info);
-                l.device.is_some()
-            }
-            None => false,
-        },
-        Err(_) => false,
-    };
-
     peripheral.subscribe(&device_info_char).await?;
-    while !device_info_configured {
-        let Some(n) = next_or_disconnected(&mut notifications, &peripheral, &mut liveness).await
-        else {
+    let device_info_configured = match tokio::time::timeout(DEVICE_INFO_TIMEOUT, async {
+        let mut configured = false;
+        while !configured {
+            let Some(n) =
+                next_or_disconnected(&mut notifications, &peripheral, &mut liveness).await
+            else {
+                return None; // disconnected before deviceInfo ever arrived
+            };
+            if n.uuid != CHAR_DEVICE_INFO {
+                continue;
+            }
+            for line in stitchers.entry(n.uuid).or_default().push(&n.value) {
+                let mut l = live.lock().unwrap();
+                let parsed = apply_json(&line, |d: DeviceInfo| l.configure(d));
+                configured = l.device.is_some();
+                if !parsed {
+                    l.dropped_frames += 1;
+                    l.touch();
+                }
+            }
+        }
+        Some(())
+    })
+    .await
+    {
+        Ok(None) => {
             set(ConnectionState::Disconnected);
             return Ok(());
-        };
-        if n.uuid != CHAR_DEVICE_INFO {
-            continue;
         }
-        for line in stitchers.entry(n.uuid).or_default().push(&n.value) {
+        Ok(Some(())) => true,
+        Err(_) => {
+            // No deviceInfo within DEVICE_INFO_TIMEOUT: degrade instead of
+            // hanging. The other four characteristics still get subscribed
+            // below and the session still reaches Streaming — the same
+            // shape of session a device with no deviceInfo produced before
+            // this function ever tried to gate raw on it — just without a
+            // channel count to size anything from, so raw stays off
+            // regardless of `raw_enabled`. Counted here since there is no
+            // logging dependency in this workspace: a human watching the
+            // CLI sees `channels=0` (and, with `--raw`, `cols=0
+            // ch0_extent=[no data yet]`) hold forever instead of populating,
+            // alongside this one-off bump in `dropped_frames`.
             let mut l = live.lock().unwrap();
-            let parsed = apply_json(&line, |d: DeviceInfo| l.configure(d));
-            device_info_configured = l.device.is_some();
-            if !parsed {
-                l.dropped_frames += 1;
-                l.touch();
-            }
+            l.dropped_frames += 1;
+            l.touch();
+            false
         }
-    }
+    };
 
     for uuid in [CHAR_POWER_BY_BAND, CHAR_CALM, CHAR_FOCUS, CHAR_SIGNAL_QUALITY] {
         peripheral.subscribe(&characteristic(&peripheral, uuid).await?).await?;
@@ -308,14 +364,16 @@ async fn try_run(
     // subscribe that fails for any other reason, just leaves raw off rather
     // than tearing down an otherwise healthy session. `Live::raw_enabled`
     // staying false is itself the visible record of that — there is no
-    // logging dependency in this workspace.
+    // logging dependency in this workspace. Also skipped outright if
+    // deviceInfo never configured `Live`: there is no channel count to
+    // decode raw bytes against.
     //
     // Subscribed last, immediately before we start draining the stream: raw
     // is the one characteristic where an evicted notification can't self-heal
     // (see the comment below), so unlike the four JSON streams above, the gap
     // between "notifications can arrive" and "something is reading them" has
     // to be kept as close to zero as it can be.
-    if raw_enabled {
+    if raw_enabled && device_info_configured {
         let subscribed = match characteristic(&peripheral, CHAR_RAW).await {
             Ok(raw_char) => peripheral.subscribe(&raw_char).await.is_ok(),
             Err(_) => false,
