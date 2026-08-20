@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::auth::{Credentials, TokenStore};
+use crate::auth::{AuthError, Credentials, TokenStore};
 use crate::record::Recorder;
 use crate::state::{ConnectionState, Live};
 
@@ -21,7 +21,41 @@ pub fn backoff_delay(attempt: u32) -> Duration {
 /// resets the delay.
 const MIN_SESSION_FOR_RESET: Duration = Duration::from_secs(10);
 
-/// Runs the BLE session forever, reconnecting with backoff.
+/// Whether a given `AuthError` means retrying is pointless: the same input
+/// (env, credentials) will fail the same way every time, so looping only
+/// burns cycles and, for `Remote`, hammers the identity service.
+///
+/// - `MissingEnv`: an env var absent at process start will not appear
+///   mid-run. Terminal.
+/// - `Remote`: the identity service actively rejected the request (wrong
+///   password, unknown email, ...). No retry fixes a bad credential.
+///   Terminal.
+/// - `Malformed`: the response parsed as HTTP but not into the shape we
+///   expect. This is a contract mismatch (wrong endpoint/region, an API
+///   change) rather than noise — the same well-formed response will fail
+///   to parse the same way every time. Terminal.
+/// - `Http`: a transport failure. The network can come back on its own.
+///   Transient.
+/// - `Store`: a token-cache read/write failure. Not actually reachable
+///   through `token()` today — `TokenStore::load`/`save` failures are
+///   swallowed to a warning before they become an `AuthError` a caller
+///   sees — but if that ever changes: it describes local system state
+///   (locked keychain, a permissions hiccup), which can clear up without
+///   user action. Transient.
+fn is_terminal(err: &AuthError) -> bool {
+    matches!(err, AuthError::MissingEnv(_) | AuthError::Remote(_) | AuthError::Malformed(_))
+}
+
+/// Same question as [`is_terminal`], for the `anyhow::Error` shape
+/// `ble::run` actually returns. Anything that isn't an `AuthError` at all —
+/// a Bluetooth/adapter failure, say — is transient: the headset can be
+/// turned back on or brought back into range.
+fn error_is_terminal(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<AuthError>().is_some_and(is_terminal)
+}
+
+/// Runs the BLE session forever, reconnecting with backoff, until a
+/// terminal auth error ends it for good.
 ///
 /// `ble::run` returns `Ok(())` only via a clean disconnect (leaving
 /// `Live::connection == Disconnected`, set by `run` itself) and `Err` only
@@ -34,6 +68,11 @@ const MIN_SESSION_FOR_RESET: Duration = Duration::from_secs(10);
 /// backoff. `Ok` resets it too, but only if the run lasted at least
 /// `MIN_SESSION_FOR_RESET` — see that constant's doc comment for why a bare
 /// `Ok` is not enough on its own.
+///
+/// A terminal error (see [`is_terminal`]) is the one case that does not
+/// loop: it sets `Failed` (not `Reconnecting`), names the actual problem on
+/// stderr, and returns, since retrying a bad password or a missing env var
+/// cannot succeed and would otherwise hammer the identity service forever.
 pub async fn supervise(
     live: Arc<Mutex<Live>>,
     creds: Credentials,
@@ -59,6 +98,17 @@ pub async fn supervise(
             recorder.clone(),
         )
         .await;
+
+        if let Err(e) = &result {
+            if error_is_terminal(e) {
+                eprintln!("session failed: {e:#}");
+                let mut l = live.lock().unwrap();
+                l.connection = ConnectionState::Failed;
+                l.touch();
+                return;
+            }
+        }
+
         let ran_long_enough = started.elapsed() >= MIN_SESSION_FOR_RESET;
 
         // Logged before the state flips to Reconnecting below, so a human
@@ -97,5 +147,45 @@ mod tests {
     fn caps_at_thirty_seconds() {
         assert_eq!(backoff_delay(5), Duration::from_secs(30));
         assert_eq!(backoff_delay(50), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn missing_env_var_is_terminal() {
+        assert!(is_terminal(&AuthError::MissingEnv("NEUROSITY_PASSWORD".into())));
+    }
+
+    #[test]
+    fn a_rejection_from_the_identity_service_is_terminal() {
+        assert!(is_terminal(&AuthError::Remote("INVALID_LOGIN_CREDENTIALS".into())));
+    }
+
+    #[test]
+    fn a_response_that_does_not_parse_as_expected_is_terminal() {
+        assert!(is_terminal(&AuthError::Malformed("no idToken field".into())));
+    }
+
+    #[test]
+    fn a_transport_failure_is_transient() {
+        assert!(!is_terminal(&AuthError::Http("connection reset".into())));
+    }
+
+    #[test]
+    fn a_token_store_failure_is_transient() {
+        assert!(!is_terminal(&AuthError::Store("keychain locked".into())));
+    }
+
+    #[test]
+    fn an_auth_error_wrapped_in_anyhow_is_still_classified() {
+        let err: anyhow::Error = AuthError::Remote("INVALID_LOGIN_CREDENTIALS".into()).into();
+        assert!(error_is_terminal(&err));
+    }
+
+    #[test]
+    fn a_non_auth_error_is_treated_as_transient() {
+        // e.g. a Bluetooth/adapter failure from `ble::run`, which has
+        // nothing to do with `AuthError` at all: the headset can be turned
+        // back on or brought back into range.
+        let err = anyhow::anyhow!("no Bluetooth adapter available");
+        assert!(!error_is_terminal(&err));
     }
 }
