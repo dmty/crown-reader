@@ -10,7 +10,7 @@ pub fn decimate(samples: &[f32], width: usize) -> Vec<(f32, f32)> {
         .map(|col| {
             let start = col * samples.len() / cols;
             let end = (((col + 1) * samples.len()) / cols).max(start + 1);
-            samples[start..end.min(samples.len())]
+            samples[start..end]
                 .iter()
                 .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| {
                     (lo.min(v), hi.max(v))
