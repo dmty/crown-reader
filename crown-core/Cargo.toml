@@ -14,3 +14,4 @@ uuid.workspace = true
 futures.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
+dotenvy.workspace = true

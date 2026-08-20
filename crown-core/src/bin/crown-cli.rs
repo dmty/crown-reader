@@ -7,6 +7,11 @@ use crown_core::state::Live;
 
 #[tokio::main]
 async fn main() {
+    // Load a `.env` from the working directory or any parent, if one exists.
+    // Absent file is the normal case, not an error — already-exported variables
+    // take precedence, so a real environment always wins over the file.
+    let _ = dotenvy::dotenv();
+
     let raw_enabled = std::env::args().any(|a| a == "--raw");
     let creds = match Credentials::from_env() {
         Ok(c) => c,
