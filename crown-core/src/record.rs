@@ -6,6 +6,14 @@ use std::path::{Path, PathBuf};
 use crate::raw::RawSample;
 use crate::streams::DeviceInfo;
 
+/// Mirrors `state::MAX_CHANNELS`, which is private to that module and so
+/// cannot be shared directly. Keep the two in sync if either changes:
+/// `Recorder::start` must cap the same way `Live::configure` does, or a
+/// `DeviceInfo` claiming more channels than `Live`'s rings will ever emit
+/// produces a header `write_raw`'s width guard then rejects every real
+/// sample against.
+const MAX_CHANNELS: usize = 64;
+
 /// Writes one session to disk: raw samples as CSV, derived metrics as JSON
 /// lines, and a metadata file. Recording is secondary to streaming, so a
 /// disk write failing here must not take the BLE loop down with it — every
@@ -46,6 +54,12 @@ impl Recorder {
     /// prior recording. This matters because `session_name()`'s resolution
     /// is one second — a stop/start double-tap within the same second would
     /// otherwise collide and destroy the earlier session's files.
+    ///
+    /// `info` is reconciled, not trusted as-is: `channels` is capped by
+    /// both `channel_names.len()` and `MAX_CHANNELS`, and a report with
+    /// zero usable channels after that is rejected with
+    /// `io::ErrorKind::InvalidData` before any file is created, rather than
+    /// producing a recorder whose header can never match a real sample.
     pub fn start(root: &Path, info: &DeviceInfo, name: &str) -> io::Result<Self> {
         if name.is_empty() || name == "." || name == ".." || name.contains(std::path::is_separator)
         {
@@ -54,20 +68,34 @@ impl Recorder {
                 format!("invalid session name: {name:?}"),
             ));
         }
-        let dir = root.join(name);
-        fs::create_dir_all(&dir)?;
 
         // Reconciled the same way `Live::configure` reconciles a device's
         // self-reported `DeviceInfo`: the wire format does not guarantee
-        // `channels == channel_names.len()`, but the header written below,
-        // `meta.json`'s `channels`, and every row's width all must agree
-        // with each other or the CSV is malformed. Doing that reconciling
-        // here — rather than trusting the caller to have already done it —
-        // means the three agree by construction no matter what `info` was
-        // built from.
-        let columns = info.channels.min(info.channel_names.len());
+        // `channels == channel_names.len()`, and does not bound either
+        // against a corrupt or hostile report, but the header written
+        // below, `meta.json`'s `channels`, and every row's width all must
+        // agree with each other or the CSV is malformed. Doing that
+        // reconciling here — capped at `MAX_CHANNELS` exactly as
+        // `Live::configure` caps it, rather than trusting the caller to
+        // have already done it — means the three agree by construction no
+        // matter what `info` was built from.
+        let columns = info.channels.min(info.channel_names.len()).min(MAX_CHANNELS);
+        if columns == 0 {
+            // `Live::configure` makes the matching call for the same
+            // reason: applying a zero-channel report leaves nothing usable
+            // configured. A caller finding out here, before any file is
+            // created, is far better than discovering it when the first
+            // real sample latches recording off.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DeviceInfo has zero usable channels after reconciliation",
+            ));
+        }
         let mut channel_names = info.channel_names.clone();
         channel_names.truncate(columns);
+
+        let dir = root.join(name);
+        fs::create_dir_all(&dir)?;
 
         let mut raw = BufWriter::new(new_file(&dir.join("raw.csv"))?);
         writeln!(raw, "timestamp,{}", channel_names.join(","))?;
@@ -309,6 +337,54 @@ mod tests {
             let err = Recorder::start(&root, &info(), bad).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "name {bad:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn start_caps_channels_at_max_channels_like_live_configure_does() {
+        let root = std::env::temp_dir().join(format!("crown-test-{}", std::process::id()));
+        let mut huge = info();
+        huge.channels = 1000;
+        huge.channel_names = (0..1000).map(|i| format!("CH{i}")).collect();
+        let mut rec = Recorder::start(&root, &huge, "session-cap").unwrap();
+
+        // Reconciliation must stop at MAX_CHANNELS (64), the same bound
+        // `Live::configure` applies — not at `channel_names.len()` (1000),
+        // which would produce a header wider than `Live`'s rings ever emit.
+        rec.write_raw(&RawSample { timestamp: 1, marker: 0, data: vec![0.0; 64] }).unwrap();
+        let err = rec
+            .write_raw(&RawSample { timestamp: 2, marker: 0, data: vec![0.0; 1000] })
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        drop(rec);
+
+        let dir = root.join("session-cap");
+        let raw = std::fs::read_to_string(dir.join("raw.csv")).unwrap();
+        assert_eq!(raw.lines().next().unwrap().matches(',').count(), 64);
+
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta["channels"], 64);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn start_rejects_a_device_info_with_zero_usable_channels() {
+        let root = std::env::temp_dir().join(format!("crown-test-{}", std::process::id()));
+
+        let mut empty_names = info();
+        empty_names.channel_names = vec![];
+        let err = Recorder::start(&root, &empty_names, "session-zero-a").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let mut zero_channels = info();
+        zero_channels.channels = 0;
+        let err = Recorder::start(&root, &zero_channels, "session-zero-b").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // Neither attempt should have left a session directory behind.
+        assert!(!root.join("session-zero-a").exists());
+        assert!(!root.join("session-zero-b").exists());
     }
 
     #[test]
