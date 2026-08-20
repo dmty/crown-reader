@@ -192,7 +192,7 @@ fn new_file(path: &Path) -> io::Result<File> {
 /// cleanup), but here it would mean the last (up to) buffer's worth of
 /// recording — as much as several hundred milliseconds of raw samples —
 /// can vanish with no signal at all, on exactly the path (dropping the
-/// `Recorder`) that Task 14 uses to stop a session. So `Recorder` flushes
+/// `Recorder`) the caller uses to stop a session. So `Recorder` flushes
 /// explicitly first and reports a failure the same way every other
 /// recorder write failure is reported in this codebase; the field-level
 /// `BufWriter`s still flush again right after, harmlessly, since a second
