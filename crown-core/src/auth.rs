@@ -140,22 +140,45 @@ impl TokenStore for MemoryStore {
     }
 }
 
+/// A body that fails to parse into the shape an endpoint is expected to
+/// return is not automatically a contract mismatch: something in front of
+/// the service (a load balancer, a captive portal) can return its own error
+/// page — a 502, an HTML redirect — that never resembles the endpoint's own
+/// JSON at all. On a non-success HTTP status, that is what `Malformed`
+/// almost always actually is, so it is reclassified here as `Http`
+/// (transient — the network path can recover) instead. A `Remote` result is
+/// left untouched regardless of status: the identity service itself sends
+/// structured rejections (wrong password, unknown email) on a non-2xx
+/// response, and that must keep being classified as an unrecoverable
+/// rejection, not a transient transport failure — reclassifying it would
+/// silently reopen looping against a rejecting endpoint. Once this runs,
+/// `Malformed` genuinely means "a success status with a body we do not
+/// understand" — see `backoff::is_terminal`'s doc comment, which relies on
+/// exactly that invariant to treat `Malformed` as terminal.
+fn reclassify_by_status(err: AuthError, status: reqwest::StatusCode) -> AuthError {
+    match err {
+        AuthError::Malformed(m) if !status.is_success() => {
+            AuthError::Http(format!("HTTP {status} with an unparseable body: {m}"))
+        }
+        other => other,
+    }
+}
+
 async fn sign_in(creds: &Credentials, client: &reqwest::Client) -> Result<String, AuthError> {
     let body = serde_json::json!({
         "email": creds.email,
         "password": creds.password,
         "returnSecureToken": true,
     });
-    let text = client
+    let response = client
         .post(format!("{SIGN_IN_URL}?key={API_KEY}"))
         .json(&body)
         .send()
         .await
-        .map_err(|e| AuthError::Http(e.to_string()))?
-        .text()
-        .await
         .map_err(|e| AuthError::Http(e.to_string()))?;
-    parse_sign_in(&text)
+    let status = response.status();
+    let text = response.text().await.map_err(|e| AuthError::Http(e.to_string()))?;
+    parse_sign_in(&text).map_err(|e| reclassify_by_status(e, status))
 }
 
 pub async fn mint_token(creds: &Credentials) -> Result<String, AuthError> {
@@ -168,17 +191,16 @@ pub async fn mint_token(creds: &Credentials) -> Result<String, AuthError> {
         .expect("reqwest client with a timeout is always buildable");
     let id_token = sign_in(creds, &client).await?;
     let body = serde_json::json!({ "data": { "deviceId": creds.device_id } });
-    let text = client
+    let response = client
         .post(CREATE_TOKEN_URL)
         .bearer_auth(id_token)
         .json(&body)
         .send()
         .await
-        .map_err(|e| AuthError::Http(e.to_string()))?
-        .text()
-        .await
         .map_err(|e| AuthError::Http(e.to_string()))?;
-    parse_token_response(&text)
+    let status = response.status();
+    let text = response.text().await.map_err(|e| AuthError::Http(e.to_string()))?;
+    parse_token_response(&text).map_err(|e| reclassify_by_status(e, status))
 }
 
 /// Caching is an optimization; a broken store must not fail a successful mint.
@@ -245,6 +267,38 @@ mod tests {
     fn token_response_malformed_json_is_reported() {
         let err = parse_token_response("not json").unwrap_err();
         assert!(matches!(err, AuthError::Malformed(_)));
+    }
+
+    #[test]
+    fn a_non_success_status_reclassifies_an_unparseable_body_as_transient() {
+        // e.g. a 502 from a gateway, or a captive portal's HTML: not a
+        // contract mismatch, a transport problem.
+        let reclassified = reclassify_by_status(
+            AuthError::Malformed("expected value at line 1 column 1".into()),
+            reqwest::StatusCode::BAD_GATEWAY,
+        );
+        assert!(matches!(reclassified, AuthError::Http(_)));
+    }
+
+    #[test]
+    fn a_success_status_leaves_a_malformed_body_alone() {
+        let reclassified = reclassify_by_status(
+            AuthError::Malformed("no idToken field".into()),
+            reqwest::StatusCode::OK,
+        );
+        assert!(matches!(reclassified, AuthError::Malformed(_)));
+    }
+
+    #[test]
+    fn a_structured_rejection_is_not_reclassified_even_on_a_non_success_status() {
+        // The identity service itself sends these on a non-2xx response;
+        // reclassifying them would reopen looping against a rejecting
+        // endpoint.
+        let reclassified = reclassify_by_status(
+            AuthError::Remote("INVALID_LOGIN_CREDENTIALS".into()),
+            reqwest::StatusCode::BAD_REQUEST,
+        );
+        assert!(matches!(reclassified, AuthError::Remote(_)));
     }
 
     #[test]
