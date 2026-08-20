@@ -8,6 +8,17 @@ use crate::streams::{DeviceInfo, PowerByBand, SignalQuality};
 /// Seconds of raw signal held in memory for the waveform.
 const RING_SECONDS: f64 = 10.0;
 
+/// Sane bounds for a device's self-reported sampling rate. The report
+/// arrives as untrusted BLE JSON; without a ceiling, a corrupt or hostile
+/// value can make the capacity computation below request an unreasonable
+/// (or overflowing) allocation. The Crown reports 256.
+const MIN_SAMPLING_RATE_HZ: f64 = 1.0;
+const MAX_SAMPLING_RATE_HZ: f64 = 100_000.0;
+
+/// Upper bound on channel count. The Crown has 8; this is headroom against
+/// a corrupt report, not a real limit.
+const MAX_CHANNELS: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
     Disconnected,
@@ -67,10 +78,34 @@ impl Live {
         }
     }
 
-    /// Sizes every per-channel structure from the device's own report.
-    pub fn configure(&mut self, info: DeviceInfo) {
-        let cap = ((info.sampling_rate * RING_SECONDS) as usize).max(1);
-        self.rings = (0..info.channels).map(|_| ChannelRing::new(cap)).collect();
+    /// Sizes every per-channel structure from the device's own report. The
+    /// report is untrusted, so this is also where it gets sanitized:
+    /// `channels` is reconciled against `channel_names.len()` (the smaller
+    /// wins) and capped at `MAX_CHANNELS`, so `Snapshot.waveform.len() ==
+    /// Snapshot.channel_names.len()` always holds downstream. A report with
+    /// no usable channels after reconciliation is dropped rather than
+    /// applied: the previous configuration (or the unconfigured state) is
+    /// kept, and the drop is counted via `dropped_frames` so it isn't silent.
+    pub fn configure(&mut self, mut info: DeviceInfo) {
+        let channels = info.channels.min(info.channel_names.len()).min(MAX_CHANNELS);
+        if channels == 0 {
+            self.dropped_frames += 1;
+            self.touch();
+            return;
+        }
+
+        let sampling_rate = if info.sampling_rate.is_finite() {
+            info.sampling_rate.clamp(MIN_SAMPLING_RATE_HZ, MAX_SAMPLING_RATE_HZ)
+        } else {
+            MIN_SAMPLING_RATE_HZ
+        };
+
+        info.channels = channels;
+        info.channel_names.truncate(channels);
+        info.sampling_rate = sampling_rate;
+
+        let cap = (sampling_rate * RING_SECONDS) as usize;
+        self.rings = (0..channels).map(|_| ChannelRing::new(cap)).collect();
         self.device = Some(info);
         self.touch();
     }
@@ -191,12 +226,58 @@ mod tests {
     #[test]
     fn configure_survives_a_nonsense_sampling_rate() {
         let mut live = Live::new();
-        for rate in [0.0, -1.0, f64::NAN] {
+        // 0, negative, and NaN are rejected outright; 1e300 is finite but
+        // far outside any sane range and must be clamped instead of
+        // producing a multi-terabyte (or overflowing) ring capacity.
+        for rate in [0.0, -1.0, f64::NAN, 1e300] {
             let mut d = info(2);
             d.sampling_rate = rate;
             live.configure(d);
             assert_eq!(live.snapshot(10).waveform.len(), 2);
+            assert_eq!(live.snapshot(10).channel_names.len(), 2);
         }
+    }
+
+    #[test]
+    fn configure_with_zero_usable_channels_is_dropped_not_applied() {
+        let mut live = Live::new();
+        let before_rev = live.snapshot(10).rev;
+        live.configure(info(0));
+        let snap = live.snapshot(10);
+        assert_eq!(snap.dropped_frames, 1);
+        assert!(snap.device_name.is_none());
+        assert!(snap.waveform.is_empty());
+        assert!(snap.channel_names.is_empty());
+        assert!(snap.rev > before_rev, "the drop must still be observable via rev");
+    }
+
+    #[test]
+    fn configure_reconciles_a_channels_and_channel_names_mismatch() {
+        let mut live = Live::new();
+        let mut d = info(4);
+        d.channels = 6; // claims 6 channels but only reports 4 names
+        live.configure(d);
+        let snap = live.snapshot(10);
+        assert_eq!(snap.waveform.len(), 4);
+        assert_eq!(snap.channel_names.len(), 4);
+    }
+
+    #[test]
+    fn configure_bounds_an_excessive_channel_count() {
+        let mut live = Live::new();
+        live.configure(info(1000));
+        let snap = live.snapshot(10);
+        assert_eq!(snap.waveform.len(), MAX_CHANNELS);
+        assert_eq!(snap.channel_names.len(), MAX_CHANNELS);
+    }
+
+    #[test]
+    fn rev_increments_on_push_raw() {
+        let mut live = Live::new();
+        live.configure(info(2));
+        let before = live.snapshot(10).rev;
+        live.push_raw(&RawSample { timestamp: 1, marker: 0, data: vec![1.0, 2.0] });
+        assert!(live.snapshot(10).rev > before);
     }
 
     #[test]
