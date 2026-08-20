@@ -29,6 +29,14 @@ pub mod qobject {
         // Whether `Live` has a configured device, i.e. whether starting a
         // recording is possible right now.
         #[qproperty(bool, ready)]
+        // The message from the most recent session-ending failure, empty
+        // when there isn't one. `supervise` deliberately never prints a
+        // terminal error itself so there is exactly one place a human sees
+        // it; for this front end, this property is that place. Cleared at
+        // the start of the next `start()` call, not on every tick, since a
+        // `Failed` session doesn't retry on its own — the message should
+        // stay put until the user acts on it.
+        #[qproperty(QString, error)]
         // Bumped by `tick()` only when it actually refreshed the cached
         // snapshot. QML bindings that read invokables backed by that
         // snapshot (`channels()`, `quality()`, `band()`, `waveform()`) read
@@ -101,11 +109,18 @@ pub struct CrownBridgeRust {
     raw: bool,
     active: bool,
     ready: bool,
+    error: QString,
     rev: i32,
     live: Arc<Mutex<Live>>,
     recorder: Arc<Mutex<Option<Recorder>>>,
     runtime: Option<tokio::runtime::Runtime>,
     handle: Option<tokio::task::JoinHandle<()>>,
+    // Written by the spawned `supervise` task on a terminal error, read and
+    // republished by `tick()` as the `error` property. A separate lock from
+    // `live` rather than a new `Live` field: this is GUI presentation state
+    // (a formatted message for a specific front end), not part of the
+    // core-to-UI contract `Live`/`Snapshot` define.
+    last_error: Arc<Mutex<Option<String>>>,
     // `None` until the first tick, distinct from a real revision (which
     // starts at 0 too) so the very first call always refreshes rather than
     // reading as "unchanged" by coincidence.
@@ -128,11 +143,13 @@ impl Default for CrownBridgeRust {
             raw: false,
             active: false,
             ready: false,
+            error: QString::from(""),
             rev: 0,
             live: Arc::new(Mutex::new(Live::new())),
             recorder: Arc::new(Mutex::new(None)),
             runtime: None,
             handle: None,
+            last_error: Arc::new(Mutex::new(None)),
             last_rev: None,
             snapshot: None,
             warned_missing_quality: RefCell::new(HashSet::new()),
@@ -165,11 +182,17 @@ impl qobject::CrownBridge {
             return;
         }
 
+        // A fresh attempt starts with a clean slate: any message from a
+        // previous terminal failure no longer describes the current state.
+        *crown_core::sync::lock(&self.last_error) = None;
+        self.as_mut().set_error(QString::from(""));
+
         let creds = match Credentials::from_env() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("crown-qt: {e}");
-                self.as_mut().set_connection(QString::from(format!("{e}")));
+                let msg = format!("{e}");
+                eprintln!("crown-qt: {msg}");
+                self.as_mut().set_error(QString::from(msg));
                 return;
             }
         };
@@ -183,25 +206,48 @@ impl qobject::CrownBridge {
         let store = Arc::new(KeyringStore { account: creds.email.clone() });
         let recorder = self.recorder.clone();
         let raw_enabled = self.raw;
-        // `supervise` returns `anyhow::Result<()>`; the bridge only ever
-        // needs to know whether the task is still running (`is_finished`),
-        // not why it ended, so the result is discarded here rather than
-        // pulling `anyhow` into this crate just to name the type.
+        let last_error = self.last_error.clone();
+        // `supervise` never prints a terminal error itself (see its doc
+        // comment) so that there is exactly one place a human sees it; for
+        // this front end, that place is `last_error`, republished by
+        // `tick()` as the `error` property, plus this stderr line for
+        // anyone running the GUI from a terminal.
         let handle = self.runtime.as_ref().expect("runtime just ensured present").spawn(
             async move {
-                let _ =
+                if let Err(e) =
                     crown_core::backoff::supervise(live, creds, store, raw_enabled, recorder)
-                        .await;
+                        .await
+                {
+                    let msg = format!("{e:#}");
+                    eprintln!("crown-qt: {msg}");
+                    *crown_core::sync::lock(&last_error) = Some(msg);
+                }
             },
         );
         self.as_mut().rust_mut().handle = Some(handle);
     }
 
     pub fn tick(mut self: Pin<&mut Self>, width: i32) -> bool {
+        // Checked unconditionally, ahead of the snapshot-unchanged early
+        // return below: `error` is written by a different task on its own
+        // schedule, not by anything that also bumps `Live::rev`, so tying
+        // its refresh to "did the snapshot change" could leave a freshly
+        // set message unpublished for however long `Live` next happens to
+        // change (in the GUI's idle `Failed` state, `Live` may never change
+        // again — the message would never appear). A plain property with
+        // its own NOTIFY, so QML re-evaluates on the signal regardless of
+        // what `tick()` returns; guarded by a compare so an unchanged ""
+        // doesn't refire that signal every 33ms.
+        let error = crown_core::sync::lock(&self.last_error).clone().unwrap_or_default();
+        let error = QString::from(error);
+        if error != *self.error() {
+            self.as_mut().set_error(error);
+        }
+
         // Building a Snapshot decimates every channel's ring; skip that
         // work entirely, not just the property writes, when nothing changed.
         let snap = {
-            let live = self.live.lock().unwrap();
+            let live = crown_core::sync::lock(&self.live);
             if self.last_rev == Some(live.rev()) {
                 return false;
             }
@@ -230,6 +276,15 @@ impl qobject::CrownBridge {
         };
         let active = snap.connection.is_active();
         let ready = snap.device_name.is_some();
+        // While a session is active, `raw` publishes what the transport
+        // actually did (`Snapshot::raw_enabled`) rather than the user's
+        // request: a failed subscribe or the deviceInfo-timeout degrade
+        // path (see `ble.rs`) then reads as "Raw: off" instead of a button
+        // that keeps claiming success next to a blank waveform. Before a
+        // session starts there is no outcome to report yet, so this leaves
+        // the property alone — it already holds whatever `toggle_raw` last
+        // set, which is the pending choice `main.qml`'s label describes.
+        let raw = if active { snap.raw_enabled } else { *self.raw() };
 
         self.as_mut().rust_mut().snapshot = Some(snap);
 
@@ -240,6 +295,7 @@ impl qobject::CrownBridge {
         self.as_mut().set_recording(recording);
         self.as_mut().set_active(active);
         self.as_mut().set_ready(ready);
+        self.as_mut().set_raw(raw);
         let next_rev = self.rev().wrapping_add(1);
         self.as_mut().set_rev(next_rev);
         true
@@ -389,11 +445,11 @@ impl qobject::CrownBridge {
     /// (`recorder`) — see that branch's comment for why the reverse order
     /// there can latch a lie permanently.
     pub fn toggle_recording(self: Pin<&mut Self>) {
-        let mut slot = self.recorder.lock().unwrap();
+        let mut slot = crown_core::sync::lock(&self.recorder);
         if slot.is_some() {
             *slot = None; // dropping flushes and closes both writers
             drop(slot);
-            let mut live = self.live.lock().unwrap();
+            let mut live = crown_core::sync::lock(&self.live);
             live.recording = None;
             live.touch();
             return;
@@ -401,7 +457,7 @@ impl qobject::CrownBridge {
         drop(slot);
 
         let info = {
-            let live = self.live.lock().unwrap();
+            let live = crown_core::sync::lock(&self.live);
             live.device.clone()
         };
         let Some(info) = info else {
@@ -428,11 +484,11 @@ impl qobject::CrownBridge {
                 // ever observe "recording, no recorder yet" (which it
                 // silently no-ops on) — never "recorder failed, indicator
                 // stuck on".
-                let mut live = self.live.lock().unwrap();
+                let mut live = crown_core::sync::lock(&self.live);
                 live.recording = Some(dir);
                 live.touch();
                 drop(live);
-                *self.recorder.lock().unwrap() = Some(rec);
+                *crown_core::sync::lock(&self.recorder) = Some(rec);
             }
             Err(e) => eprintln!("crown-qt: failed to start recording: {e}"),
         }

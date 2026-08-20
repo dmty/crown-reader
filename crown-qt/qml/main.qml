@@ -41,6 +41,20 @@ ApplicationWindow {
 
             Text { text: "Status: " + crown.connection; font.pixelSize: 20 }
 
+            // `crown.error` only ever carries a session-ending failure
+            // (`supervise` returns on a terminal error, never a transient
+            // one) so this is the one place a windowed user sees a wrong
+            // password or a missing credential — the message is otherwise
+            // only on stderr, which a Finder-launched app has no way to show.
+            Text {
+                text: crown.error === "" ? "" : "Error: " + crown.error
+                visible: crown.error !== ""
+                color: "#c04a4a"
+                font.pixelSize: 12
+                wrapMode: Text.WordWrap
+                width: content.width
+            }
+
             Metrics {
                 id: metrics
                 bridge: crown
@@ -87,7 +101,18 @@ ApplicationWindow {
                 }
 
                 Button {
-                    text: crown.raw ? "Raw (next session): on" : "Raw (next session): off"
+                    // Two different facts share this one property, by
+                    // session phase: idle, `crown.raw` is the pending choice
+                    // the next `start()` will use, and the label says so;
+                    // active, `tick()` overwrites it with what the transport
+                    // actually did (see bridge.rs), so the same property
+                    // reads as current status instead — including going
+                    // "off" for a few seconds while a session that will
+                    // succeed is still scanning/connecting/authenticating,
+                    // before the raw subscribe has had a chance to land.
+                    text: crown.active
+                        ? (crown.raw ? "Raw: on" : "Raw: off")
+                        : (crown.raw ? "Raw (next session): on" : "Raw (next session): off")
                     // The choice only takes effect on the session `start()`
                     // spawns next: `supervise` reads it once, at spawn time, and
                     // never again, so flipping it while a session is running
