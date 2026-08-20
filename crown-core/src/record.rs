@@ -226,7 +226,8 @@ mod tests {
 
     #[test]
     fn writes_meta_raw_header_and_rows() {
-        let root = std::env::temp_dir().join(format!("crown-test-{}", std::process::id()));
+        let root = std::env::temp_dir()
+            .join(format!("crown-test-{}-writes_meta_raw_header_and_rows", std::process::id()));
         let mut rec = Recorder::start(&root, &info(), "session-a").unwrap();
         rec.write_raw(&RawSample { timestamp: 10, marker: 0, data: vec![1.5, -2.5] }).unwrap();
         rec.write_derived("calm", &serde_json::json!({"probability": 0.5})).unwrap();
@@ -257,7 +258,10 @@ mod tests {
 
     #[test]
     fn write_raw_rejects_a_width_mismatched_sample_without_corrupting_the_file() {
-        let root = std::env::temp_dir().join(format!("crown-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "crown-test-{}-write_raw_rejects_a_width_mismatched_sample",
+            std::process::id()
+        ));
         let mut rec = Recorder::start(&root, &info(), "session-width").unwrap();
 
         let err = rec
@@ -276,7 +280,8 @@ mod tests {
 
     #[test]
     fn start_reconciles_channels_and_channel_names_like_live_configure_does() {
-        let root = std::env::temp_dir().join(format!("crown-test-{}", std::process::id()));
+        let root = std::env::temp_dir()
+            .join(format!("crown-test-{}-start_reconciles_channels", std::process::id()));
         let mut mismatched = info();
         mismatched.channels = 6; // claims 6 channels but only reports 2 names
         let mut rec = Recorder::start(&root, &mismatched, "session-reconcile").unwrap();
@@ -305,7 +310,8 @@ mod tests {
 
     #[test]
     fn start_refuses_to_clobber_an_existing_session() {
-        let root = std::env::temp_dir().join(format!("crown-test-{}", std::process::id()));
+        let root = std::env::temp_dir()
+            .join(format!("crown-test-{}-start_refuses_to_clobber", std::process::id()));
         let mut first = Recorder::start(&root, &info(), "session-noclobber").unwrap();
         first.write_raw(&RawSample { timestamp: 10, marker: 0, data: vec![1.5, -2.5] }).unwrap();
         drop(first);
@@ -325,7 +331,8 @@ mod tests {
 
     #[test]
     fn start_rejects_a_session_name_that_could_escape_root() {
-        let root = std::env::temp_dir().join(format!("crown-test-{}", std::process::id()));
+        let root = std::env::temp_dir()
+            .join(format!("crown-test-{}-start_rejects_a_session_name", std::process::id()));
         for bad in ["..", "../elsewhere", "nested/path", ""] {
             let err = Recorder::start(&root, &info(), bad).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "name {bad:?} should be rejected");
@@ -334,7 +341,8 @@ mod tests {
 
     #[test]
     fn start_caps_channels_at_max_channels_like_live_configure_does() {
-        let root = std::env::temp_dir().join(format!("crown-test-{}", std::process::id()));
+        let root = std::env::temp_dir()
+            .join(format!("crown-test-{}-start_caps_channels_at_max", std::process::id()));
         let mut huge = info();
         huge.channels = 1000;
         huge.channel_names = (0..1000).map(|i| format!("CH{i}")).collect();
@@ -363,7 +371,8 @@ mod tests {
 
     #[test]
     fn start_rejects_a_device_info_with_zero_usable_channels() {
-        let root = std::env::temp_dir().join(format!("crown-test-{}", std::process::id()));
+        let root = std::env::temp_dir()
+            .join(format!("crown-test-{}-start_rejects_zero_usable_channels", std::process::id()));
 
         let mut empty_names = info();
         empty_names.channel_names = vec![];
@@ -382,7 +391,8 @@ mod tests {
 
     #[test]
     fn first_raw_write_anchors_the_clocks_in_derived_jsonl() {
-        let root = std::env::temp_dir().join(format!("crown-test-{}", std::process::id()));
+        let root = std::env::temp_dir()
+            .join(format!("crown-test-{}-first_raw_write_anchors_the_clocks", std::process::id()));
         let mut rec = Recorder::start(&root, &info(), "session-anchor").unwrap();
 
         rec.write_raw(&RawSample { timestamp: 987_654, marker: 0, data: vec![1.0, 2.0] }).unwrap();
