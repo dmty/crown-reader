@@ -5,3 +5,4 @@ pub mod decimate;
 pub mod ring;
 pub mod state;
 pub mod auth;
+pub mod ble;
