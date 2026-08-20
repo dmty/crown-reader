@@ -56,19 +56,20 @@ const MIN_STREAMING_FOR_RESET: Duration = Duration::from_secs(10);
 ///
 /// - `MissingEnv`: an env var absent at process start will not appear
 ///   mid-run. Terminal.
-/// - `Remote`: the identity service actively rejected the request (wrong
-///   password, unknown email, ...). No retry fixes a bad credential.
-///   Terminal.
-/// - `Malformed`: a *success* HTTP status with a body that didn't parse
-///   into the shape we expect (see `auth::reclassify_by_status`, which
-///   ensures a non-success status is never the cause of a `Malformed` a
-///   caller sees — those become `Http` instead). With that guaranteed, a
-///   `Malformed` here is a genuine contract mismatch (wrong endpoint/
-///   region, an API change), not transport noise: the same well-formed
-///   response will fail to parse the same way every time. Terminal.
-/// - `Http`: a transport failure, or a non-success status this project
-///   cannot otherwise explain. The network can come back on its own.
-///   Transient.
+/// - `Remote` and `Malformed`: by the time either reaches this function,
+///   `auth::reclassify_by_status` has already sorted them by HTTP status
+///   *class*, not by which of the two variants the body happened to
+///   produce — see that function's doc comment for the full rule. In
+///   short: a `Remote` or `Malformed` a caller sees here always arrived on
+///   a 2xx or a non-429 4xx, i.e. the server either answered successfully
+///   and we still couldn't use it, or told us the request itself was
+///   wrong. Neither improves by retrying the same request. Terminal. (A
+///   429 or 5xx — rate limiting, a cold-started function, any other
+///   server-side failure — is reclassified to `Http` before it gets here,
+///   precisely so it is *not* terminal.)
+/// - `Http`: a transport failure, a status this project cannot otherwise
+///   explain, or one of the reclassified 429/5xx cases above. The
+///   underlying condition can resolve on its own. Transient.
 /// - `Store`: a token-cache read/write failure. Not actually reachable
 ///   through `token()` today — `TokenStore::load`/`save` failures are
 ///   swallowed to a warning before they become an `AuthError` a caller

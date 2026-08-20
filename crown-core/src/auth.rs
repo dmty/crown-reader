@@ -140,27 +140,40 @@ impl TokenStore for MemoryStore {
     }
 }
 
-/// A body that fails to parse into the shape an endpoint is expected to
-/// return is not automatically a contract mismatch: something in front of
-/// the service (a load balancer, a captive portal) can return its own error
-/// page — a 502, an HTML redirect — that never resembles the endpoint's own
-/// JSON at all. On a non-success HTTP status, that is what `Malformed`
-/// almost always actually is, so it is reclassified here as `Http`
-/// (transient — the network path can recover) instead. A `Remote` result is
-/// left untouched regardless of status: the identity service itself sends
-/// structured rejections (wrong password, unknown email) on a non-2xx
-/// response, and that must keep being classified as an unrecoverable
-/// rejection, not a transient transport failure — reclassifying it would
-/// silently reopen looping against a rejecting endpoint. Once this runs,
-/// `Malformed` genuinely means "a success status with a body we do not
-/// understand" — see `backoff::is_terminal`'s doc comment, which relies on
-/// exactly that invariant to treat `Malformed` as terminal.
+/// Reclassifies a `Remote` or `Malformed` auth failure by the *class* of
+/// HTTP status it arrived on, independent of how the body itself happened
+/// to parse. Status class, not body shape, is the actual signal for
+/// whether an unchanged retry can help:
+///
+/// - 2xx: the server answered successfully and we still couldn't use the
+///   result. Terminal, whether that surfaced as `Remote` (a rejection
+///   embedded in a 200 body) or `Malformed` (a 200 with a body we don't
+///   understand).
+/// - 4xx except 429: the request itself was wrong — bad credentials, a
+///   stale/wrong endpoint, a malformed request. Retrying the same request
+///   cannot change that. Terminal, whether `Remote` or `Malformed` — a 404
+///   that happens to parse as valid JSON without the field we expect
+///   (`Malformed`) is exactly as unfixable by retrying as a 400 with a
+///   structured `error.message` (`Remote`); both are the server saying the
+///   request was wrong, just in different shapes.
+/// - 429 or 5xx: rate limiting and server-side failure (including a
+///   cold-started function returning a structured `Remote`-shaped
+///   `INTERNAL`/`UNAVAILABLE` body). This is exactly what backoff exists
+///   for. Reclassified to `Http` — transient — regardless of body shape.
+/// - No status at all: `sign_in`/`mint_token`'s own `.send()`/`.text()`
+///   failures are already `AuthError::Http` before this function is ever
+///   called, so this function never sees them. Unchanged, transient.
+///
+/// Once this runs, a `Remote` or `Malformed` a caller sees always arrived
+/// on a status this project treats as terminal (2xx or non-429 4xx) — see
+/// `backoff::is_terminal`'s doc comment, which relies on that invariant.
 fn reclassify_by_status(err: AuthError, status: reqwest::StatusCode) -> AuthError {
-    match err {
-        AuthError::Malformed(m) if !status.is_success() => {
-            AuthError::Http(format!("HTTP {status} with an unparseable body: {m}"))
-        }
-        other => other,
+    let terminal_status =
+        status.is_success() || (status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS);
+    if matches!(&err, AuthError::Remote(_) | AuthError::Malformed(_)) && !terminal_status {
+        AuthError::Http(format!("HTTP {status}: {err}"))
+    } else {
+        err
     }
 }
 
@@ -299,6 +312,40 @@ mod tests {
             reqwest::StatusCode::BAD_REQUEST,
         );
         assert!(matches!(reclassified, AuthError::Remote(_)));
+    }
+
+    #[test]
+    fn a_structured_rejection_on_a_server_error_status_is_transient() {
+        // A cold-started function can return a perfectly structured
+        // `{"error":{"message":"INTERNAL"}}` on a 500 -- that's exactly
+        // what backoff exists for, not a rejection that will repeat.
+        let reclassified = reclassify_by_status(
+            AuthError::Remote("INTERNAL".into()),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        );
+        assert!(matches!(reclassified, AuthError::Http(_)));
+    }
+
+    #[test]
+    fn a_rate_limited_response_is_transient() {
+        let reclassified = reclassify_by_status(
+            AuthError::Remote("rate limited".into()),
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+        );
+        assert!(matches!(reclassified, AuthError::Http(_)));
+    }
+
+    #[test]
+    fn a_shape_mismatched_body_on_a_client_error_status_is_terminal() {
+        // The exact shape a wrong-region 404 would produce: valid JSON,
+        // but neither an error.message nor a result.token field. The
+        // request itself is wrong; retrying an unchanged request cannot
+        // fix that, regardless of how the body happened to parse.
+        let reclassified = reclassify_by_status(
+            AuthError::Malformed("no result.token field".into()),
+            reqwest::StatusCode::NOT_FOUND,
+        );
+        assert!(matches!(reclassified, AuthError::Malformed(_)));
     }
 
     #[test]
