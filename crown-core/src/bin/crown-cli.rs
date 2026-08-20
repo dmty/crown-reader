@@ -47,13 +47,9 @@ async fn main() -> anyhow::Result<()> {
         last_dropped = snap.dropped_frames;
 
         if raw_enabled {
-            // Raw alignment check: the raw characteristic is packed binary with no
-            // delimiter or checksum, so a decoder reading it at the wrong byte
-            // offset produces plausible-looking garbage instead of an error.
-            // Snapshot doesn't expose raw timestamps, so watch channel 0's
-            // decimated extent instead: real EEG sits in a small, stable
-            // microvolt-scale range. A wild (e.g. ~1e300) or wildly asymmetric
-            // min/max means the decoder has lost alignment.
+            // Aligned decoding keeps ch0's extent in the low hundreds; finite-but-huge
+            // means misaligned bytes, and a climbing `dropped` means non-finite
+            // garbage that push_raw already filtered out before it reached here.
             let extent = snap.waveform.first().and_then(|cols| {
                 cols.iter()
                     .copied()
