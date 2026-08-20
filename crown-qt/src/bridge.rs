@@ -22,6 +22,13 @@ pub mod qobject {
         #[qproperty(i32, dropped)]
         #[qproperty(QString, recording)]
         #[qproperty(bool, raw)]
+        // Bumped by `tick()` only when it actually refreshed the cached
+        // snapshot. QML bindings that read invokables backed by that
+        // snapshot (`channels()`, `quality()`, `band()`, `waveform()`) read
+        // `rev` too, purely to pick up its NOTIFY signal — that's what makes
+        // them re-evaluate, since QML can't otherwise see that an invokable's
+        // result changed.
+        #[qproperty(i32, rev)]
         type CrownBridge = super::CrownBridgeRust;
 
         /// Pulls a snapshot and republishes it as Qt properties. Returns
@@ -67,6 +74,8 @@ pub mod qobject {
 }
 
 use core::pin::Pin;
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use cxx_qt::CxxQtType;
@@ -83,6 +92,7 @@ pub struct CrownBridgeRust {
     dropped: i32,
     recording: QString,
     raw: bool,
+    rev: i32,
     live: Arc<Mutex<Live>>,
     recorder: Arc<Mutex<Option<Recorder>>>,
     runtime: Option<tokio::runtime::Runtime>,
@@ -92,6 +102,10 @@ pub struct CrownBridgeRust {
     // reading as "unchanged" by coincidence.
     last_rev: Option<u64>,
     snapshot: Option<crown_core::state::Snapshot>,
+    // Names `quality()` has already warned about missing from the quality
+    // map, so a persistent device-info/signal-quality mismatch is reported
+    // once per name instead of once per tick.
+    warned_missing_quality: RefCell<HashSet<String>>,
 }
 
 impl Default for CrownBridgeRust {
@@ -103,12 +117,14 @@ impl Default for CrownBridgeRust {
             dropped: 0,
             recording: QString::from(""),
             raw: false,
+            rev: 0,
             live: Arc::new(Mutex::new(Live::new())),
             recorder: Arc::new(Mutex::new(None)),
             runtime: None,
             handle: None,
             last_rev: None,
             snapshot: None,
+            warned_missing_quality: RefCell::new(HashSet::new()),
         }
     }
 }
@@ -181,20 +197,36 @@ impl qobject::CrownBridge {
             live.snapshot(width.max(0) as usize)
         };
         self.as_mut().rust_mut().last_rev = Some(snap.rev);
-        self.as_mut().set_connection(QString::from(label(snap.connection)));
-        self.as_mut().set_calm(snap.calm as f64);
-        self.as_mut().set_focus(snap.focus as f64);
-        self.as_mut().set_dropped(snap.dropped_frames as i32);
+
+        // Read everything the setters below need out of `snap` before it
+        // moves into `self.snapshot`. Setters emit their NOTIFY signal
+        // synchronously, so if `self.snapshot` were assigned after them, a
+        // binding that reads a NOTIFY property and a snapshot-backed
+        // invokable in the same evaluation could run in between and see
+        // this tick's properties paired with last tick's snapshot.
+        let connection = label(snap.connection);
+        let calm = snap.calm as f64;
+        let focus = snap.focus as f64;
+        let dropped = snap.dropped_frames as i32;
         // Derived from `Snapshot.recording`, like every other displayed
         // value, rather than cached separately: `Live::recording` is the
         // one place recording start/stop and the transport's clear-on-
         // failure path (see `ble::clear_recording_indicator`) both write,
         // so this is the only way the label can't disagree with reality.
-        self.as_mut().set_recording(match &snap.recording {
+        let recording = match &snap.recording {
             Some(dir) => QString::from(dir.display().to_string()),
             None => QString::from(""),
-        });
+        };
+
         self.as_mut().rust_mut().snapshot = Some(snap);
+
+        self.as_mut().set_connection(QString::from(connection));
+        self.as_mut().set_calm(calm);
+        self.as_mut().set_focus(focus);
+        self.as_mut().set_dropped(dropped);
+        self.as_mut().set_recording(recording);
+        let next_rev = self.rev().wrapping_add(1);
+        self.as_mut().set_rev(next_rev);
         true
     }
 
@@ -208,16 +240,41 @@ impl qobject::CrownBridge {
         list
     }
 
+    /// All three failure paths render the same "unknown" grey tile in QML —
+    /// deliberately, since the display shouldn't invent a fake status — but
+    /// each is a distinct failure with a distinct cause, so each is reported
+    /// to stderr separately rather than collapsed into one silent grey.
     pub fn quality(&self, channel: i32) -> QString {
         let Some(s) = &self.snapshot else {
+            eprintln!("crown-qt: quality({channel}) called before any snapshot arrived");
             return QString::from("unknown");
         };
-        let Some(name) = s.channel_names.get(channel.max(0) as usize) else {
+        let Some(idx) = usize::try_from(channel).ok() else {
+            eprintln!("crown-qt: quality() got a negative channel index: {channel}");
+            return QString::from("unknown");
+        };
+        let Some(name) = s.channel_names.get(idx) else {
+            eprintln!(
+                "crown-qt: quality({channel}) is out of range for {} channels",
+                s.channel_names.len()
+            );
             return QString::from("unknown");
         };
         match s.quality.get(name) {
             Some(q) => QString::from(format!("{:?}", q.status)),
-            None => QString::from("unknown"),
+            None => {
+                // Reachable in practice, unlike the two paths above: the
+                // device-info and signal-quality streams name channels
+                // independently and can race or disagree. Warn once per
+                // name rather than every tick, so a real mismatch is
+                // diagnosable without flooding stderr at tick rate.
+                if self.warned_missing_quality.borrow_mut().insert(name.clone()) {
+                    eprintln!(
+                        "crown-qt: channel '{name}' is in device-info but has no entry in the quality map"
+                    );
+                }
+                QString::from("unknown")
+            }
         }
     }
 
@@ -256,7 +313,8 @@ impl qobject::CrownBridge {
     pub fn waveform(&self, channel: i32, height: f64) -> QList<QPointF> {
         let mut out = QList::<QPointF>::default();
         let Some(s) = &self.snapshot else { return out };
-        let Some(column) = s.waveform.get(channel.max(0) as usize) else {
+        let Some(idx) = usize::try_from(channel).ok() else { return out };
+        let Some(column) = s.waveform.get(idx) else {
             return out;
         };
         if column.is_empty() {
