@@ -35,7 +35,7 @@ async fn main() {
         // A poisoned lock only means a prior holder panicked; recover the state
         // instead of panicking here too, so the `Err(join_err)` arm below can
         // report the actual cause instead of an unrelated `PoisonError`.
-        let snap = live.lock().unwrap_or_else(|e| e.into_inner()).snapshot(40);
+        let snap = crown_core::sync::lock(&live).snapshot(40);
         let samples: usize = snap.waveform.first().map(|w| w.len()).unwrap_or(0);
         println!(
             "[{:>4}s] {:?} device={:?} channels={} calm={:.2} focus={:.2} cols={} dropped={} (+{})",

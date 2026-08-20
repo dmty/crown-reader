@@ -127,16 +127,16 @@ pub struct MemoryStore(Mutex<Option<String>>);
 
 impl TokenStore for MemoryStore {
     fn load(&self) -> Option<String> {
-        self.0.lock().unwrap().clone()
+        crate::sync::lock(&self.0).clone()
     }
 
     fn save(&self, token: &str) -> Result<(), AuthError> {
-        *self.0.lock().unwrap() = Some(token.to_string());
+        *crate::sync::lock(&self.0) = Some(token.to_string());
         Ok(())
     }
 
     fn clear(&self) {
-        *self.0.lock().unwrap() = None;
+        *crate::sync::lock(&self.0) = None;
     }
 }
 
