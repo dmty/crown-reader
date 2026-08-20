@@ -1,4 +1,5 @@
-use std::fs::{self, File};
+use std::fmt::Write as _;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -11,10 +12,18 @@ use crate::streams::DeviceInfo;
 /// write method returns `io::Result` and the caller decides how loud to be
 /// about a failure rather than this type panicking or silently swallowing
 /// one itself.
+#[derive(Debug)]
 pub struct Recorder {
     dir: PathBuf,
     raw: BufWriter<File>,
     derived: BufWriter<File>,
+    /// The reconciled channel count `raw.csv`'s header (and `meta.json`'s
+    /// `channels`) were built against — see `start`'s doc comment. Every
+    /// row `write_raw` accepts must have exactly this many values.
+    columns: usize,
+    /// Set once the first raw sample's device timestamp has been paired
+    /// with a host timestamp in `derived.jsonl` — see `write_raw`.
+    clock_anchor_written: bool,
 }
 
 impl Recorder {
@@ -23,39 +32,120 @@ impl Recorder {
         chrono::Local::now().format("%Y-%m-%dT%H-%M-%S").to_string()
     }
 
+    /// Starts a new session under `root/name`.
+    ///
+    /// `name` must be a single path component: no separators, and not `.`
+    /// or `..`. It is rejected outright otherwise rather than joined onto
+    /// `root` unchecked, since an absolute path or a `..` component would
+    /// let it write outside `root`. The only caller today is
+    /// `session_name()`, which always satisfies this.
+    ///
+    /// All three files are created with `create_new` semantics: a session
+    /// directory that already holds any of them fails with
+    /// `io::ErrorKind::AlreadyExists` rather than silently truncating a
+    /// prior recording. This matters because `session_name()`'s resolution
+    /// is one second — a stop/start double-tap within the same second would
+    /// otherwise collide and destroy the earlier session's files.
     pub fn start(root: &Path, info: &DeviceInfo, name: &str) -> io::Result<Self> {
+        if name.is_empty() || name == "." || name == ".." || name.contains(std::path::is_separator)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid session name: {name:?}"),
+            ));
+        }
         let dir = root.join(name);
         fs::create_dir_all(&dir)?;
 
-        let mut raw = BufWriter::new(File::create(dir.join("raw.csv"))?);
-        writeln!(raw, "timestamp,{}", info.channel_names.join(","))?;
+        // Reconciled the same way `Live::configure` reconciles a device's
+        // self-reported `DeviceInfo`: the wire format does not guarantee
+        // `channels == channel_names.len()`, but the header written below,
+        // `meta.json`'s `channels`, and every row's width all must agree
+        // with each other or the CSV is malformed. Doing that reconciling
+        // here — rather than trusting the caller to have already done it —
+        // means the three agree by construction no matter what `info` was
+        // built from.
+        let columns = info.channels.min(info.channel_names.len());
+        let mut channel_names = info.channel_names.clone();
+        channel_names.truncate(columns);
 
-        let derived = BufWriter::new(File::create(dir.join("derived.jsonl"))?);
+        let mut raw = BufWriter::new(new_file(&dir.join("raw.csv"))?);
+        writeln!(raw, "timestamp,{}", channel_names.join(","))?;
+
+        let derived = BufWriter::new(new_file(&dir.join("derived.jsonl"))?);
 
         let meta = serde_json::json!({
             "deviceId": info.device_id,
             "deviceNickname": info.device_nickname,
-            "channelNames": info.channel_names,
-            "channels": info.channels,
+            "channelNames": channel_names,
+            "channels": columns,
             "samplingRate": info.sampling_rate,
             "appVersion": env!("CARGO_PKG_VERSION"),
             "startedAt": chrono::Local::now().to_rfc3339(),
+            // `Live::push_raw` drops a sample containing a non-finite value
+            // before it ever reaches the waveform; `write_raw` below does
+            // not — it writes whatever the device sent. The two are
+            // supposed to disagree here: this is the ground-truth file.
+            "rawCsvIsVerbatim": true,
         });
-        fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
+        new_file(&dir.join("meta.json"))?.write_all(&serde_json::to_vec_pretty(&meta)?)?;
 
-        Ok(Self { dir, raw, derived })
+        Ok(Self { dir, raw, derived, columns, clock_anchor_written: false })
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
+    /// Writes one raw sample as a CSV row.
+    ///
+    /// The first successful call also anchors the clocks: it writes one
+    /// `derived.jsonl` line (`"stream":"clockAnchor"`) pairing that
+    /// sample's device-clock `timestamp` with the host-clock timestamp
+    /// `write_derived` stamps every line with, so `raw.csv`'s device time
+    /// and `derived.jsonl`'s host time can be aligned after the fact.
+    ///
+    /// Rejects — without writing anything — a sample whose channel count
+    /// disagrees with the header `start` wrote. `Live::configure` can
+    /// change the live channel count mid-session on a `deviceInfo`
+    /// re-notification (which is not itself written to `derived.jsonl`, so
+    /// there would be no record of why the row width changed); writing a
+    /// row against a stale header would corrupt `raw.csv` with no way to
+    /// recover alignment afterward, so this reports the mismatch as an
+    /// ordinary `io::Result` error instead, indistinguishable to the
+    /// caller from a disk failure — a short, honest recording beats a
+    /// corrupt one.
     pub fn write_raw(&mut self, s: &RawSample) -> io::Result<()> {
-        write!(self.raw, "{}", s.timestamp)?;
-        for v in &s.data {
-            write!(self.raw, ",{v}")?;
+        if s.data.len() != self.columns {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "sample has {} channel value(s), recorder was started with {}",
+                    s.data.len(),
+                    self.columns
+                ),
+            ));
         }
-        writeln!(self.raw)
+
+        if !self.clock_anchor_written {
+            self.write_derived("clockAnchor", &serde_json::json!(s.timestamp))?;
+            self.clock_anchor_written = true;
+        }
+
+        // Formatted as one `String` and written in a single call rather
+        // than one `write!` per value: with the latter, a failure partway
+        // through a row left whatever columns had already reached the
+        // `BufWriter`'s buffer sitting there with no newline, which
+        // `Drop`'s flush would later write out as a truncated final line.
+        // A row is now either fully formatted before it ever reaches
+        // `self.raw`, or not written at all.
+        let mut row = String::new();
+        write!(row, "{}", s.timestamp).unwrap();
+        for v in &s.data {
+            write!(row, ",{v}").unwrap();
+        }
+        row.push('\n');
+        self.raw.write_all(row.as_bytes())
     }
 
     pub fn write_derived(&mut self, stream: &str, value: &serde_json::Value) -> io::Result<()> {
@@ -66,6 +156,13 @@ impl Recorder {
         });
         writeln!(self.derived, "{line}")
     }
+}
+
+/// Creates `path`, failing with `io::ErrorKind::AlreadyExists` rather than
+/// truncating if something is already there — see `Recorder::start`'s doc
+/// comment on why a session never clobbers a prior one.
+fn new_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 /// `BufWriter`'s own `Drop` flushes but has nowhere to send a failure — the
@@ -135,6 +232,102 @@ mod tests {
         let name = Recorder::session_name();
         assert!(!name.contains(':'), "colons break on some filesystems: {name}");
         assert!(name.len() >= 10);
+    }
+
+    #[test]
+    fn write_raw_rejects_a_width_mismatched_sample_without_corrupting_the_file() {
+        let root = std::env::temp_dir().join(format!("crown-test-{}", std::process::id()));
+        let mut rec = Recorder::start(&root, &info(), "session-width").unwrap();
+
+        let err = rec
+            .write_raw(&RawSample { timestamp: 1, marker: 0, data: vec![1.0, 2.0, 3.0] })
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        drop(rec);
+
+        // The rejected sample must not have left a malformed row behind.
+        let dir = root.join("session-width");
+        let raw = std::fs::read_to_string(dir.join("raw.csv")).unwrap();
+        assert_eq!(raw.lines().count(), 1, "only the header, no row from the rejected sample");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn start_reconciles_channels_and_channel_names_like_live_configure_does() {
+        let root = std::env::temp_dir().join(format!("crown-test-{}", std::process::id()));
+        let mut mismatched = info();
+        mismatched.channels = 6; // claims 6 channels but only reports 2 names
+        let mut rec = Recorder::start(&root, &mismatched, "session-reconcile").unwrap();
+
+        // The header and meta.json must agree on the reconciled count (2),
+        // not the claimed one (6) — so a 2-value sample is accepted...
+        rec.write_raw(&RawSample { timestamp: 1, marker: 0, data: vec![1.0, 2.0] }).unwrap();
+        // ...and a sample sized to the claimed-but-unreconciled count is not.
+        let err = rec
+            .write_raw(&RawSample { timestamp: 2, marker: 0, data: vec![1.0; 6] })
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        drop(rec);
+
+        let dir = root.join("session-reconcile");
+        let raw = std::fs::read_to_string(dir.join("raw.csv")).unwrap();
+        assert_eq!(raw.lines().next().unwrap(), "timestamp,CP3,C3");
+
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta["channels"], 2);
+        assert_eq!(meta["channelNames"], serde_json::json!(["CP3", "C3"]));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn start_refuses_to_clobber_an_existing_session() {
+        let root = std::env::temp_dir().join(format!("crown-test-{}", std::process::id()));
+        let mut first = Recorder::start(&root, &info(), "session-noclobber").unwrap();
+        first.write_raw(&RawSample { timestamp: 10, marker: 0, data: vec![1.5, -2.5] }).unwrap();
+        drop(first);
+
+        // A second `start` for the same root/name — e.g. a same-second
+        // stop/start double-tap — must fail rather than truncate the first
+        // session's files.
+        let err = Recorder::start(&root, &info(), "session-noclobber").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+
+        let dir = root.join("session-noclobber");
+        let raw = std::fs::read_to_string(dir.join("raw.csv")).unwrap();
+        assert_eq!(raw.lines().nth(1).unwrap(), "10,1.5,-2.5", "first session's data must survive");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn start_rejects_a_session_name_that_could_escape_root() {
+        let root = std::env::temp_dir().join(format!("crown-test-{}", std::process::id()));
+        for bad in ["..", "../elsewhere", "nested/path", ""] {
+            let err = Recorder::start(&root, &info(), bad).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "name {bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn first_raw_write_anchors_the_clocks_in_derived_jsonl() {
+        let root = std::env::temp_dir().join(format!("crown-test-{}", std::process::id()));
+        let mut rec = Recorder::start(&root, &info(), "session-anchor").unwrap();
+
+        rec.write_raw(&RawSample { timestamp: 987_654, marker: 0, data: vec![1.0, 2.0] }).unwrap();
+        rec.write_raw(&RawSample { timestamp: 987_655, marker: 0, data: vec![1.0, 2.0] }).unwrap();
+        drop(rec);
+
+        let dir = root.join("session-anchor");
+        let derived = std::fs::read_to_string(dir.join("derived.jsonl")).unwrap();
+        let lines: Vec<&str> = derived.lines().collect();
+        assert_eq!(lines.len(), 1, "the anchor is written once, on the first raw sample only");
+        assert!(lines[0].contains("\"stream\":\"clockAnchor\""));
+        assert!(lines[0].contains("\"value\":987654"), "anchor must carry the device timestamp: {}", lines[0]);
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
