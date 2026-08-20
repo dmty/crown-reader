@@ -19,11 +19,12 @@ async fn main() {
         account: creds.email.clone(),
     });
     let live = Arc::new(Mutex::new(Live::new()));
+    let recorder = Arc::new(Mutex::new(None));
 
     let worker = tokio::spawn({
         let live = live.clone();
         let store = store.clone();
-        async move { ble::run(live, creds, store, raw_enabled).await }
+        async move { ble::run(live, creds, store, raw_enabled, recorder).await }
     });
 
     let started = Instant::now();
