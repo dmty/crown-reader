@@ -6,9 +6,15 @@ use crown_core::ble;
 use crown_core::state::Live;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
     let raw_enabled = std::env::args().any(|a| a == "--raw");
-    let creds = Credentials::from_env()?;
+    let creds = match Credentials::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("session failed: {e:#}");
+            std::process::exit(1);
+        }
+    };
     let store = Arc::new(KeyringStore {
         account: creds.email.clone(),
     });
@@ -66,6 +72,18 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    worker.await??;
-    Ok(())
+    // Every exit path names what happened on stderr: this tool's whole job is
+    // to tell a human wearing the headset whether the Bluetooth path works,
+    // so a silent stop is indistinguishable from a hang.
+    match worker.await {
+        Ok(Ok(())) => eprintln!("session ended: device disconnected"),
+        Ok(Err(e)) => {
+            eprintln!("session failed: {e:#}");
+            std::process::exit(1);
+        }
+        Err(join_err) => {
+            eprintln!("session failed: worker task panicked: {join_err}");
+            std::process::exit(1);
+        }
+    }
 }
