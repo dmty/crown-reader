@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::decimate::decimate;
 use crate::raw::RawSample;
@@ -17,7 +18,7 @@ const MAX_SAMPLING_RATE_HZ: f64 = 100_000.0;
 
 /// Upper bound on channel count. The Crown has 8; this is headroom against
 /// a corrupt report, not a real limit.
-const MAX_CHANNELS: usize = 64;
+pub(crate) const MAX_CHANNELS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -59,6 +60,13 @@ pub struct Live {
     pub dropped_frames: u64,
     pub raw_samples: u64,
     pub recording: Option<PathBuf>,
+    /// When the current run last transitioned into `Streaming`, if it has.
+    /// Set by `ble::run` on that transition and cleared back to `None` when
+    /// a fresh run starts scanning, so a caller measuring how long a session
+    /// actually streamed (as opposed to how long the whole attempt,
+    /// including scanning and auth, took) has a reliable signal to read
+    /// after the run ends.
+    pub streaming_since: Option<Instant>,
     rings: Vec<ChannelRing>,
     rev: u64,
 }
@@ -76,6 +84,7 @@ impl Live {
             dropped_frames: 0,
             raw_samples: 0,
             recording: None,
+            streaming_since: None,
             rings: Vec::new(),
             rev: 0,
         }
@@ -129,6 +138,13 @@ impl Live {
     /// Call after any mutation so pollers can skip unchanged state.
     pub fn touch(&mut self) {
         self.rev += 1;
+    }
+
+    /// Current revision, without building a `Snapshot`. Lets a poller skip
+    /// the snapshot itself (waveform decimation included) when nothing has
+    /// changed, rather than building one only to discard it.
+    pub fn rev(&self) -> u64 {
+        self.rev
     }
 
     pub fn snapshot(&self, width_px: usize) -> Snapshot {

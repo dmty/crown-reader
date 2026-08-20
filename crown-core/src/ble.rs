@@ -1,6 +1,6 @@
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, WriteType};
@@ -238,6 +238,22 @@ pub enum AuthOutcome {
     NoAnswer,
 }
 
+/// The device rejected the Bluetooth token twice in a row: once on the
+/// token `try_run` started with, and again after a forced re-mint. A typed
+/// error rather than a string, so a caller (`supervise`) can classify it as
+/// terminal by type rather than by matching on message text: no amount of
+/// retrying fixes a token the device itself refuses to authenticate twice.
+#[derive(Debug)]
+pub struct DeviceRejectedToken;
+
+impl std::fmt::Display for DeviceRejectedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "device rejected the Bluetooth token twice")
+    }
+}
+
+impl std::error::Error for DeviceRejectedToken {}
+
 /// Writes the minted JWT and reads back `[isAuthenticated, expiresIn]`.
 ///
 /// The read is bounded by `AUTH_READ_TIMEOUT`: btleplug has no timeout of its
@@ -346,9 +362,23 @@ async fn try_run(
     raw_enabled: bool,
     recorder: Arc<Mutex<Option<Recorder>>>,
 ) -> Result<()> {
+    // `streaming_since` is managed here, alongside `connection`, rather than
+    // by the caller: `Scanning` marks the start of a fresh attempt and
+    // clears any timestamp left over from a previous run on this same
+    // `Live` (it is not recreated per attempt), and `Streaming` is the one
+    // transition that stamps it. Every other state (`Connecting`,
+    // `Authenticating`, `Disconnected`) leaves it alone — in particular,
+    // `Disconnected` must not clear it, since a caller reading `Live` after
+    // `run()` returns (to measure how long the session actually streamed)
+    // needs it to still be there.
     let set = |s: ConnectionState| {
         let mut l = live.lock().unwrap();
         l.connection = s;
+        match s {
+            ConnectionState::Scanning => l.streaming_since = None,
+            ConnectionState::Streaming => l.streaming_since = Some(Instant::now()),
+            _ => {}
+        }
         l.touch();
     };
 
@@ -388,7 +418,7 @@ async fn try_run(
                 retried = true;
             }
             AuthOutcome::Rejected => {
-                return Err(anyhow!("device rejected the Bluetooth token twice"));
+                return Err(DeviceRejectedToken.into());
             }
         }
     }
