@@ -4,7 +4,6 @@ import QtQuick.Layouts
 ColumnLayout {
     id: root
     required property var bridge
-    property int rev: 0   // bumped by main.qml each tick to force re-evaluation
 
     spacing: 10
 
@@ -35,24 +34,35 @@ ColumnLayout {
                 required property string modelData
                 Text { text: modelData; font.pixelSize: 12; opacity: 0.6 }
                 Text {
-                    text: (root.rev, root.bridge.band(modelData)).toFixed(3)
+                    text: {
+                        root.bridge.rev; // re-read on every tick bump; band() is an invokable, not a bound property
+                        return root.bridge.band(modelData).toFixed(3);
+                    }
                     font.family: "Menlo"
                 }
             }
         }
     }
 
+    // `Layout.fillWidth` only takes effect because `root`'s own width is
+    // bound by whoever instantiates this component (see main.qml): without
+    // that, Flow has nothing to wrap against and just grows wide enough to
+    // fit every tile on one line, pushing tiles for channels above what fits
+    // off-screen instead of onto a second row.
     Flow {
         Layout.fillWidth: true
         spacing: 8
         Repeater {
-            model: root.rev, root.bridge.channels()
+            model: {
+                root.bridge.rev; // re-read on every tick bump; channels() is an invokable, not a bound property
+                return root.bridge.channels();
+            }
             Rectangle {
                 required property int index
                 required property string modelData
                 width: 78; height: 26; radius: 4
                 color: {
-                    root.rev; // re-read on every tick bump; quality() is an invokable, not a bound property
+                    root.bridge.rev; // re-read on every tick bump; quality() is an invokable, not a bound property
                     const q = root.bridge.quality(index);
                     if (q === "Great") return "#3fa34d";
                     if (q === "Good") return "#8ab661";
