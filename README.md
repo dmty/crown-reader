@@ -20,10 +20,10 @@ Core knows nothing about Qt, so the UI layer is replaceable.
 BLE access needs a cloud-minted token, so credentials come from the environment:
 
 ```bash
-export NEUROSITY_EMAIL='...'
-export NEUROSITY_PASSWORD='...'
-export NEUROSITY_DEVICE_ID='...'
+cp .env.example .env   # then fill in NEUROSITY_EMAIL, NEUROSITY_PASSWORD, NEUROSITY_DEVICE_ID
 ```
+
+Both binaries read `.env` from the working directory or any parent. Variables already exported in your shell win, and `.env` is gitignored.
 
 The minted token is cached in the system keyring, so the app runs offline between mints. The headset accepts one connection at a time — disconnect the Neurosity app first.
 
