@@ -558,7 +558,6 @@ dependencies = [
 name = "crown-qt"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "crown-core",
  "cxx",
  "cxx-qt",

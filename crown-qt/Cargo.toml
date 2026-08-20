@@ -9,7 +9,6 @@ cxx = "1"
 cxx-qt = "0.9.1"
 cxx-qt-lib = { version = "0.9.1", features = ["full"] }
 tokio.workspace = true
-anyhow.workspace = true
 
 [build-dependencies]
 cxx-qt-build = { version = "0.9.1", features = ["link_qt_object_files"] }

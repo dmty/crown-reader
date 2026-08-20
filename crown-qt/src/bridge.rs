@@ -40,6 +40,7 @@ pub struct CrownBridgeRust {
     dropped: i32,
     live: Arc<Mutex<Live>>,
     runtime: Option<tokio::runtime::Runtime>,
+    handle: Option<tokio::task::JoinHandle<()>>,
     last_rev: u64,
 }
 
@@ -52,6 +53,7 @@ impl Default for CrownBridgeRust {
             dropped: 0,
             live: Arc::new(Mutex::new(Live::new())),
             runtime: None,
+            handle: None,
             last_rev: 0,
         }
     }
@@ -70,33 +72,57 @@ fn label(s: ConnectionState) -> &'static str {
 }
 
 impl qobject::CrownBridge {
+    /// `Some(runtime)` used to mean "a session was ever started", which left
+    /// Connect permanently inert after `supervise` returns on its own for a
+    /// terminal auth error: the runtime was still `Some`, so clicking
+    /// Connect again silently did nothing. The guard now keys on whether the
+    /// spawned task is still running, not on whether one was ever spawned,
+    /// so a finished session can be restarted.
     pub fn start(mut self: Pin<&mut Self>) {
-        if self.runtime.is_some() {
+        let already_running = self.handle.as_ref().is_some_and(|h| !h.is_finished());
+        if already_running {
             return;
         }
+
         let creds = match Credentials::from_env() {
             Ok(c) => c,
             Err(e) => {
+                eprintln!("crown-qt: {e}");
                 self.as_mut().set_connection(QString::from(format!("{e}")));
                 return;
             }
         };
-        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+        if self.runtime.is_none() {
+            let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+            self.as_mut().rust_mut().runtime = Some(runtime);
+        }
+
         let live = self.live.clone();
         let store = Arc::new(KeyringStore { account: creds.email.clone() });
         let recorder = Arc::new(Mutex::new(None));
-        runtime.spawn(crown_core::backoff::supervise(live, creds, store, false, recorder));
-        self.as_mut().rust_mut().runtime = Some(runtime);
+        // `supervise` returns `anyhow::Result<()>`; the bridge only ever
+        // needs to know whether the task is still running (`is_finished`),
+        // not why it ended, so the result is discarded here rather than
+        // pulling `anyhow` into this crate just to name the type.
+        let handle = self.runtime.as_ref().expect("runtime just ensured present").spawn(
+            async move {
+                let _ = crown_core::backoff::supervise(live, creds, store, false, recorder).await;
+            },
+        );
+        self.as_mut().rust_mut().handle = Some(handle);
     }
 
     pub fn tick(mut self: Pin<&mut Self>, width: i32) {
+        // Building a Snapshot decimates every channel's ring; skip that
+        // work entirely, not just the property writes, when nothing changed.
         let snap = {
             let live = self.live.lock().unwrap();
+            if live.rev() == self.last_rev {
+                return;
+            }
             live.snapshot(width.max(0) as usize)
         };
-        if snap.rev == self.last_rev {
-            return;
-        }
         self.as_mut().rust_mut().last_rev = snap.rev;
         self.as_mut().set_connection(QString::from(label(snap.connection)));
         self.as_mut().set_calm(snap.calm as f64);
