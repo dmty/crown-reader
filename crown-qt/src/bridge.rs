@@ -6,6 +6,11 @@ pub mod qobject {
 
         include!("cxx-qt-lib/qstringlist.h");
         type QStringList = cxx_qt_lib::QStringList;
+
+        include!("cxx-qt-lib/qpointf.h");
+        type QPointF = cxx_qt_lib::QPointF;
+        include!("cxx-qt-lib/qlist.h");
+        type QList_QPointF = cxx_qt_lib::QList<QPointF>;
     }
 
     extern "RustQt" {
@@ -40,6 +45,10 @@ pub mod qobject {
         /// Mean power across channels for the named band.
         #[qinvokable]
         fn band(&self, name: &QString) -> f64;
+
+        /// One channel's decimated envelope as a polyline, scaled to `height`.
+        #[qinvokable]
+        fn waveform(&self, channel: i32, height: f64) -> QList_QPointF;
     }
 }
 
@@ -47,7 +56,7 @@ use core::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use cxx_qt::CxxQtType;
-use cxx_qt_lib::{QString, QStringList};
+use cxx_qt_lib::{QList, QPointF, QString, QStringList};
 
 use crown_core::auth::{Credentials, KeyringStore};
 use crown_core::state::{ConnectionState, Live};
@@ -197,5 +206,34 @@ impl qobject::CrownBridge {
         } else {
             values.iter().sum::<f64>() / values.len() as f64
         }
+    }
+
+    /// One channel's decimated envelope as a polyline. Each column contributes
+    /// two points (min then max), so the zigzag paints a filled-looking trace.
+    /// Y is pre-scaled here because QML has no cheap way to map thousands of
+    /// points itself.
+    pub fn waveform(&self, channel: i32, height: f64) -> QList<QPointF> {
+        let mut out = QList::<QPointF>::default();
+        let Some(s) = &self.snapshot else { return out };
+        let Some(column) = s.waveform.get(channel.max(0) as usize) else {
+            return out;
+        };
+        if column.is_empty() {
+            return out;
+        }
+
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &(min, max) in column {
+            lo = lo.min(min);
+            hi = hi.max(max);
+        }
+        let span = ((hi - lo) as f64).max(1e-6);
+
+        let map = |v: f32| height - ((v - lo) as f64 / span) * height;
+        for (x, &(min, max)) in column.iter().enumerate() {
+            out.append(QPointF::new(x as f64, map(min)));
+            out.append(QPointF::new(x as f64, map(max)));
+        }
+        out
     }
 }

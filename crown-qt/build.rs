@@ -4,7 +4,8 @@ fn main() {
     CxxQtBuilder::new_qml_module(
         QmlModule::new("com.crownreader.app")
             .qml_file("qml/main.qml")
-            .qml_file("qml/Metrics.qml"),
+            .qml_file("qml/Metrics.qml")
+            .qml_file("qml/Waveform.qml"),
     )
     // Qt Qml requires linking Qt Network on macOS.
     .qt_module("Network")
