@@ -174,7 +174,7 @@ impl qobject::CrownBridge {
             return QString::from("unknown");
         };
         match s.quality.get(name) {
-            Some(q) => QString::from(&format!("{:?}", q.status)),
+            Some(q) => QString::from(format!("{:?}", q.status)),
             None => QString::from("unknown"),
         }
     }
