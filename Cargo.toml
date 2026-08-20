@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crown-core"]
+members = ["crown-core", "crown-qt"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
