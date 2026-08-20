@@ -76,8 +76,7 @@ impl Live {
     }
 
     pub fn push_raw(&mut self, s: &RawSample) {
-        let aligned = s.data.len() == self.rings.len() && !self.rings.is_empty();
-        if !aligned || s.data.iter().any(|v| !v.is_finite()) {
+        if s.data.len() != self.rings.len() || self.rings.is_empty() || s.data.iter().any(|v| !(*v as f32).is_finite()) {
             self.dropped_frames += 1;
             self.touch();
             return;
