@@ -12,9 +12,9 @@ impl Stitcher {
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
         while let Some(i) = self.buf.iter().position(|&b| b == b'\n') {
-            if let Ok(text) = std::str::from_utf8(&self.buf[..i]) {
-                let text = text.to_string();
-                self.buf.drain(..=i);
+            let text = std::str::from_utf8(&self.buf[..i]).ok().map(str::to_string);
+            self.buf.drain(..=i);
+            if let Some(text) = text {
                 if !text.is_empty() {
                     out.push(text);
                 }
@@ -60,5 +60,11 @@ mod tests {
         let bytes = "héllo\n".as_bytes();
         assert!(s.push(&bytes[..2]).is_empty());
         assert_eq!(s.push(&bytes[2..]), vec!["héllo".to_string()]);
+    }
+
+    #[test]
+    fn invalid_utf8_line_is_skipped_without_stalling() {
+        let mut s = Stitcher::default();
+        assert_eq!(s.push(b"\xff\xfe\ngood\n"), vec!["good".to_string()]);
     }
 }
