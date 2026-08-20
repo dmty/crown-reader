@@ -26,6 +26,16 @@ pub enum QualityStatus {
     Good,
     Bad,
     NoContact,
+    /// Any status label the device sends that isn't one of the four above.
+    /// Without this catch-all, one unrecognised label fails `SignalQuality`
+    /// (a `BTreeMap`)'s *entire* parse — every electrode tile goes grey, not
+    /// just the one with the odd label — since a single bad map entry fails
+    /// the whole map in serde's default `Deserialize` for `BTreeMap`. QML
+    /// already renders any status it doesn't recognise (this included) as a
+    /// grey tile, so degrading here is a strict improvement: seven honest
+    /// readings and one grey tile beats eight grey tiles.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -76,6 +86,34 @@ mod tests {
         let q: SignalQuality = serde_json::from_str(json).unwrap();
         assert_eq!(q["CP3"].status, QualityStatus::Great);
         assert_eq!(q["C3"].status, QualityStatus::NoContact);
+    }
+
+    #[test]
+    fn an_unrecognised_quality_label_degrades_to_unknown_instead_of_failing_the_whole_map() {
+        // Without `#[serde(other)]` on `QualityStatus::Unknown`, the
+        // unrecognised "somethingNew" label below fails `SignalQuality`'s
+        // entire parse -- not just the C3 entry -- which is exactly the bug
+        // this variant exists to prevent.
+        let json = r#"{"CP3":{"standardDeviation":8.1,"status":"great"},
+                       "C3":{"standardDeviation":50.0,"status":"somethingNew"}}"#;
+        let q: SignalQuality = serde_json::from_str(json).unwrap();
+        assert_eq!(q["CP3"].status, QualityStatus::Great);
+        assert_eq!(q["C3"].status, QualityStatus::Unknown);
+    }
+
+    #[test]
+    fn quality_status_debug_output_matches_what_the_qt_bridge_and_qml_depend_on() {
+        // crown-qt's bridge publishes `format!("{:?}", status)` and
+        // Metrics.qml string-compares the result against these exact
+        // literals ("Great"/"Good"/"Bad"/"NoContact", falling through to a
+        // grey tile for anything else, `Unknown` included). Pinning `Debug`
+        // here means a variant rename breaks this test instead of silently
+        // turning every tile grey with no compile error.
+        assert_eq!(format!("{:?}", QualityStatus::Great), "Great");
+        assert_eq!(format!("{:?}", QualityStatus::Good), "Good");
+        assert_eq!(format!("{:?}", QualityStatus::Bad), "Bad");
+        assert_eq!(format!("{:?}", QualityStatus::NoContact), "NoContact");
+        assert_eq!(format!("{:?}", QualityStatus::Unknown), "Unknown");
     }
 
     #[test]
