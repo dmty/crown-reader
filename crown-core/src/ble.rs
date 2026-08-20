@@ -99,60 +99,83 @@ fn apply_json<T: serde::de::DeserializeOwned>(line: &str, apply: impl FnOnce(T))
     }
 }
 
-/// Writes decoded raw samples to the active recorder, if any.
+/// Writes decoded raw samples to the active recorder, if any. Returns
+/// `true` if this call was the one that just turned recording off, so the
+/// caller can clear `Live::recording` to match — deliberately not done in
+/// here: locking `live` while still holding `recorder`'s guard would invert
+/// the lock order `run`'s doc comment establishes. The caller locks
+/// `recorder` (via this function), lets the guard drop, and only then
+/// locks `live`.
 ///
 /// Called only after the caller's `live` lock has already been released —
 /// see `run`'s doc comment for the lock-ordering rule this keeps. A write
-/// failure is a disk problem, not a streaming one: recording is secondary
-/// to the live connection, so it must not propagate into `try_run`'s
-/// `Result` and tear the session down over a full disk. It also must not
-/// free-run `eprintln!` at the raw sample rate: a disk failure (full disk,
-/// unplugged drive) does not heal itself sample-to-sample, and at up to
-/// ~256 samples/sec a per-sample warning would itself become a source of
-/// loop stalls — the exact hazard this module's own comments call out as a
-/// contributor to raw desync. So the first failure is reported once and
-/// stops the recording (`recorder` set to `None`) rather than retried.
-fn record_raw_samples(recorder: &Mutex<Option<Recorder>>, samples: &[RawSample]) {
+/// failure — a disk problem, or `Recorder::write_raw` rejecting a
+/// width-mismatched sample — is not a streaming problem: recording is
+/// secondary to the live connection, so it must not propagate into
+/// `try_run`'s `Result` and tear the session down. It also must not
+/// free-run `eprintln!` at the raw sample rate: neither failure heals
+/// itself sample-to-sample, and at up to ~256 samples/sec a per-sample
+/// warning would itself become a source of loop stalls — the exact hazard
+/// this module's own comments call out as a contributor to raw desync. So
+/// the first failure is reported once and stops the recording (`recorder`
+/// set to `None`) rather than retried.
+fn record_raw_samples(recorder: &Mutex<Option<Recorder>>, samples: &[RawSample]) -> bool {
     if samples.is_empty() {
-        return;
+        return false;
     }
-    let mut guard = recorder.lock().unwrap();
-    let Some(r) = guard.as_mut() else { return };
+    let mut guard = recorder.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(r) = guard.as_mut() else { return false };
     for s in samples {
         if let Err(e) = r.write_raw(s) {
             eprintln!("warning: recorder stopped, failed to write raw sample: {e}");
             *guard = None;
-            return;
+            return true;
         }
     }
+    false
 }
 
 /// Records a successfully-parsed derived-metric line to the active
-/// recorder, if any. Only `calm`, `focus`, `powerByBand`, and
-/// `signalQuality` are derived streams; `deviceInfo` (and anything else
-/// routed through this dispatch) is metadata already captured once in
-/// `meta.json`, and is not written again here.
+/// recorder, if any. Returns `true` on the same "recording just stopped"
+/// condition as `record_raw_samples`, for the same reason. Only `calm`,
+/// `focus`, `powerByBand`, and `signalQuality` are derived streams;
+/// `deviceInfo` (and anything else routed through this dispatch) is
+/// metadata already captured once in `meta.json`, and is not written again
+/// here.
 ///
 /// Called only after the caller's `live` lock has already been released —
 /// same ordering rule as `record_raw_samples`. Latches off on the first
 /// write failure for the same reason: a disk failure persists, so retrying
 /// every line would eventually add up to the same kind of noisy, self-
 /// inflicted stall `record_raw_samples` avoids, just on a slower clock.
-fn record_derived_line(recorder: &Mutex<Option<Recorder>>, uuid: Uuid, line: &str) {
+fn record_derived_line(recorder: &Mutex<Option<Recorder>>, uuid: Uuid, line: &str) -> bool {
     let name = match uuid {
         CHAR_CALM => "calm",
         CHAR_FOCUS => "focus",
         CHAR_POWER_BY_BAND => "powerByBand",
         CHAR_SIGNAL_QUALITY => "signalQuality",
-        _ => return,
+        _ => return false,
     };
-    let mut guard = recorder.lock().unwrap();
-    let Some(r) = guard.as_mut() else { return };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
+    let mut guard = recorder.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(r) = guard.as_mut() else { return false };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return false };
     if let Err(e) = r.write_derived(name, &v) {
         eprintln!("warning: recorder stopped, failed to write derived sample: {e}");
         *guard = None;
+        return true;
     }
+    false
+}
+
+/// Clears `Live::recording` after a recorder write failure has already
+/// turned the recorder itself off. Called with `recorder`'s lock already
+/// released (both call sites above only return `true` after dropping their
+/// guard), so this is the only place in the raw/derived recording path
+/// that locks `live` — never nested inside a `recorder` lock.
+fn clear_recording_indicator(live: &Mutex<Live>) {
+    let mut l = live.lock().unwrap();
+    l.recording = None;
+    l.touch();
 }
 
 /// Writes `jwt` to the auth characteristic.
@@ -291,12 +314,14 @@ async fn next_or_disconnected(
 /// `recorder` starts (and typically stays) `None`; a caller flips it to
 /// `Some` to turn recording on mid-session and back to `None` to turn it
 /// off, without needing to restart the connection. This is stronger than a
-/// consistent lock order: everywhere below that touches both, `live`'s
-/// lock is acquired *and released* before `recorder`'s is ever taken, so
-/// the two locks are never held at the same time. There is no ordering for
-/// a caller elsewhere (e.g. a future UI thread) to invert, because there is
-/// no window in which this code holds one while waiting on the other.
-/// Neither lock is ever held across an `.await`.
+/// consistent lock order: everywhere below that touches both, one guard is
+/// fully acquired *and released* before the other is ever taken — `live`
+/// then `recorder` when pushing a sample, `recorder` then `live` when a
+/// write failure needs `Live::recording` cleared to match — so the two
+/// locks are never held at the same time in either direction. There is no
+/// ordering for a caller elsewhere (e.g. a future UI thread) to invert into
+/// a cycle, because there is no window in which this code holds one while
+/// waiting on the other. Neither lock is ever held across an `.await`.
 pub async fn run(
     live: Arc<Mutex<Live>>,
     creds: Credentials,
@@ -527,7 +552,9 @@ async fn try_run(
                     l.push_raw(s);
                 }
             } // `live`'s lock is dropped here, before `recorder` is ever touched.
-            record_raw_samples(&recorder, &samples);
+            if record_raw_samples(&recorder, &samples) {
+                clear_recording_indicator(&live);
+            }
             continue;
         }
 
@@ -561,8 +588,8 @@ async fn try_run(
                 parsed
             }; // `live`'s lock is dropped here, before `recorder` is ever touched.
 
-            if parsed {
-                record_derived_line(&recorder, n.uuid, &line);
+            if parsed && record_derived_line(&recorder, n.uuid, &line) {
+                clear_recording_indicator(&live);
             }
         }
     }
