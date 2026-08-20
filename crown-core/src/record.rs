@@ -68,6 +68,28 @@ impl Recorder {
     }
 }
 
+/// `BufWriter`'s own `Drop` flushes but has nowhere to send a failure — the
+/// stdlib docs are explicit that a flush error at that point is discarded.
+/// For most `BufWriter` users that is an acceptable trade (best-effort
+/// cleanup), but here it would mean the last (up to) buffer's worth of
+/// recording — as much as several hundred milliseconds of raw samples —
+/// can vanish with no signal at all, on exactly the path (dropping the
+/// `Recorder`) that Task 14 uses to stop a session. So `Recorder` flushes
+/// explicitly first and reports a failure the same way every other
+/// recorder write failure is reported in this codebase; the field-level
+/// `BufWriter`s still flush again right after, harmlessly, since a second
+/// flush of an already-empty buffer is a no-op.
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        if let Err(e) = self.raw.flush() {
+            eprintln!("warning: recorder failed to flush raw.csv on drop: {e}");
+        }
+        if let Err(e) = self.derived.flush() {
+            eprintln!("warning: recorder failed to flush derived.jsonl on drop: {e}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +135,27 @@ mod tests {
         let name = Recorder::session_name();
         assert!(!name.contains(':'), "colons break on some filesystems: {name}");
         assert!(name.len() >= 10);
+    }
+
+    #[test]
+    fn dropped_recorder_flushes_all_buffered_data_without_an_explicit_flush() {
+        let root = std::env::temp_dir().join(format!("crown-test-flush-{}", std::process::id()));
+        let mut rec = Recorder::start(&root, &info(), "session-b").unwrap();
+
+        // Comfortably exceeds BufWriter's default 8 KiB buffer, so part of
+        // this is still sitting unflushed in memory the moment `rec` drops
+        // below — nothing here ever calls flush() explicitly.
+        let n: u64 = 2000;
+        for i in 0..n {
+            rec.write_raw(&RawSample { timestamp: i, marker: 0, data: vec![1.5, -2.5] }).unwrap();
+        }
+        drop(rec);
+
+        let dir = root.join("session-b");
+        let raw = std::fs::read_to_string(dir.join("raw.csv")).unwrap();
+        assert_eq!(raw.lines().count(), n as usize + 1, "header plus every row must survive drop");
+        assert_eq!(raw.lines().last().unwrap(), format!("{},1.5,-2.5", n - 1));
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
