@@ -75,6 +75,14 @@ ApplicationWindow {
 
                 Button {
                     text: crown.recording === "" ? "Record" : "Stop"
+                    // A device must be configured before there's anything
+                    // to record against — `toggleRecording()` no-ops with
+                    // only a stderr line otherwise, which an app launched
+                    // outside a terminal (e.g. from Finder) never sees.
+                    // Once true this never goes false again (`Live.device`
+                    // is only ever replaced, never cleared), so this never
+                    // fights with an in-progress recording's "Stop" state.
+                    enabled: crown.ready
                     onClicked: crown.toggleRecording()
                 }
 

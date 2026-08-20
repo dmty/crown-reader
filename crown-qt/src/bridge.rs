@@ -26,6 +26,9 @@ pub mod qobject {
         // raw toggle on a fact rather than string-matching `connection`
         // against `label()`'s output.
         #[qproperty(bool, active)]
+        // Whether `Live` has a configured device, i.e. whether starting a
+        // recording is possible right now.
+        #[qproperty(bool, ready)]
         // Bumped by `tick()` only when it actually refreshed the cached
         // snapshot. QML bindings that read invokables backed by that
         // snapshot (`channels()`, `quality()`, `band()`, `waveform()`) read
@@ -97,6 +100,7 @@ pub struct CrownBridgeRust {
     recording: QString,
     raw: bool,
     active: bool,
+    ready: bool,
     rev: i32,
     live: Arc<Mutex<Live>>,
     recorder: Arc<Mutex<Option<Recorder>>>,
@@ -123,6 +127,7 @@ impl Default for CrownBridgeRust {
             recording: QString::from(""),
             raw: false,
             active: false,
+            ready: false,
             rev: 0,
             live: Arc::new(Mutex::new(Live::new())),
             recorder: Arc::new(Mutex::new(None)),
@@ -224,6 +229,7 @@ impl qobject::CrownBridge {
             None => QString::from(""),
         };
         let active = snap.connection.is_active();
+        let ready = snap.device_name.is_some();
 
         self.as_mut().rust_mut().snapshot = Some(snap);
 
@@ -233,6 +239,7 @@ impl qobject::CrownBridge {
         self.as_mut().set_dropped(dropped);
         self.as_mut().set_recording(recording);
         self.as_mut().set_active(active);
+        self.as_mut().set_ready(ready);
         let next_rev = self.rev().wrapping_add(1);
         self.as_mut().set_rev(next_rev);
         true
