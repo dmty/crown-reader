@@ -69,7 +69,7 @@ impl Live {
 
     /// Sizes every per-channel structure from the device's own report.
     pub fn configure(&mut self, info: DeviceInfo) {
-        let cap = (info.sampling_rate * RING_SECONDS) as usize;
+        let cap = ((info.sampling_rate * RING_SECONDS) as usize).max(1);
         self.rings = (0..info.channels).map(|_| ChannelRing::new(cap)).collect();
         self.device = Some(info);
         self.touch();
@@ -186,5 +186,16 @@ mod tests {
         let before = live.snapshot(10).rev;
         live.configure(info(2));
         assert!(live.snapshot(10).rev > before);
+    }
+
+    #[test]
+    fn configure_survives_a_nonsense_sampling_rate() {
+        let mut live = Live::new();
+        for rate in [0.0, -1.0, f64::NAN] {
+            let mut d = info(2);
+            d.sampling_rate = rate;
+            live.configure(d);
+            assert_eq!(live.snapshot(10).waveform.len(), 2);
+        }
     }
 }
