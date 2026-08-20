@@ -43,6 +43,17 @@ const AUTH_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// waiting a few extra seconds.
 const DEVICE_INFO_TIMEOUT: Duration = Duration::from_secs(15);
 
+// These two bounds cover the auth read and the deviceInfo wait
+// specifically — they are not a general guarantee that `Authenticating`
+// (or any other state) is bounded. `connect()`, `discover_services()`,
+// `write_jwt`'s `p.write()`, and every `subscribe()` call below are the
+// same kind of unbounded btleplug await, with the same "only a value or a
+// disconnect resolves it, nothing else" shape, and none of them have a
+// timeout here. A device that acknowledges the connection but never
+// completes one of those calls still hangs the session indefinitely. Known
+// limitation, not addressed in this round — adding timeouts to every
+// btleplug call is a larger change than fits here.
+
 /// Scans for a headset by advertised name. The service UUID is not used as a
 /// scan filter because the device does not reliably advertise it.
 pub async fn find_crown(adapter: &Adapter) -> Result<Peripheral> {
@@ -130,22 +141,36 @@ async fn write_jwt(p: &Peripheral, auth: &btleplug::api::Characteristic, jwt: &s
     Ok(())
 }
 
+/// Outcome of one auth-characteristic exchange.
+///
+/// A timeout is not evidence the token was bad — only the device actually
+/// answering `false` is — so `NoAnswer` is kept distinct from `Rejected`
+/// rather than folded into it: a caller must not clear a cached token, and
+/// must not spend its one retry, on a device that simply didn't respond in
+/// time.
+pub enum AuthOutcome {
+    /// The device accepted the token; carries the response's `expiresIn`,
+    /// if it sent one.
+    Accepted(Option<f64>),
+    /// The device answered with `isAuthenticated: false`.
+    Rejected,
+    /// No answer arrived within `AUTH_READ_TIMEOUT`.
+    NoAnswer,
+}
+
 /// Writes the minted JWT and reads back `[isAuthenticated, expiresIn]`.
 ///
 /// The read is bounded by `AUTH_READ_TIMEOUT`: btleplug has no timeout of its
 /// own on a characteristic read (see that constant's doc comment), and
 /// this characteristic is never subscribed, so — unlike the deviceInfo read
 /// this codebase deliberately avoids (see `try_run`) — there is no
-/// notification stream whose data an abandoned read future could steal. A
-/// timeout here is converted to `ok = false` rather than an error, so it
-/// flows through the caller's existing mint-once-more-then-fail retry
-/// instead of surfacing as a different kind of failure.
-pub async fn authenticate(p: &Peripheral, jwt: &str) -> Result<(bool, Option<f64>)> {
+/// notification stream whose data an abandoned read future could steal.
+pub async fn authenticate(p: &Peripheral, jwt: &str) -> Result<AuthOutcome> {
     let auth = characteristic(p, CHAR_AUTH).await?;
     write_jwt(p, &auth, jwt).await?;
     let raw = match tokio::time::timeout(AUTH_READ_TIMEOUT, p.read(&auth)).await {
         Ok(read) => read?,
-        Err(_) => return Ok((false, None)),
+        Err(_) => return Ok(AuthOutcome::NoAnswer),
     };
     let parsed: serde_json::Value = serde_json::from_slice(&raw)?;
     let ok = parsed
@@ -153,7 +178,7 @@ pub async fn authenticate(p: &Peripheral, jwt: &str) -> Result<(bool, Option<f64
         .and_then(|v| v.as_bool())
         .ok_or_else(|| anyhow!("auth response missing boolean: {parsed}"))?;
     let expires_in = parsed.get(1).and_then(|v| v.as_f64());
-    Ok((ok, expires_in))
+    Ok(if ok { AuthOutcome::Accepted(expires_in) } else { AuthOutcome::Rejected })
 }
 
 type Notifications = Pin<Box<dyn futures::Stream<Item = btleplug::api::ValueNotification> + Send>>;
@@ -249,15 +274,29 @@ async fn try_run(
 
     set(ConnectionState::Authenticating);
     let mut jwt = token(&creds, store.as_ref(), false).await?;
-    let (mut ok, _) = authenticate(&peripheral, &jwt).await?;
-    if !ok {
-        // A cached token can outlive its validity; mint once more, then give up.
-        store.clear();
-        jwt = token(&creds, store.as_ref(), true).await?;
-        (ok, _) = authenticate(&peripheral, &jwt).await?;
-    }
-    if !ok {
-        return Err(anyhow!("device rejected the Bluetooth token twice"));
+    let mut retried = false;
+    loop {
+        match authenticate(&peripheral, &jwt).await? {
+            AuthOutcome::Accepted(_) => break,
+            AuthOutcome::NoAnswer => {
+                // Not a rejection: the cached token may be fine and the
+                // device just didn't answer in time. Leave the cache alone
+                // and fail outright rather than spending the one retry on
+                // an inconclusive result.
+                return Err(anyhow!(
+                    "device did not answer the auth read within {AUTH_READ_TIMEOUT:?}"
+                ));
+            }
+            AuthOutcome::Rejected if !retried => {
+                // A cached token can outlive its validity; mint once more, then give up.
+                store.clear();
+                jwt = token(&creds, store.as_ref(), true).await?;
+                retried = true;
+            }
+            AuthOutcome::Rejected => {
+                return Err(anyhow!("device rejected the Bluetooth token twice"));
+            }
+        }
     }
 
     // The notification stream must exist before any subscribe call: btleplug
