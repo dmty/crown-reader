@@ -77,7 +77,7 @@ impl qobject::CrownBridge {
         let creds = match Credentials::from_env() {
             Ok(c) => c,
             Err(e) => {
-                self.as_mut().set_connection(QString::from(&format!("{e}")));
+                self.as_mut().set_connection(QString::from(format!("{e}")));
                 return;
             }
         };
