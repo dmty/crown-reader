@@ -142,6 +142,13 @@ pub async fn run(
         return Err(anyhow!("device rejected the Bluetooth token twice"));
     }
 
+    // The notification stream must exist before we subscribe: btleplug only
+    // delivers notifications that arrive after this call, and deviceInfo may
+    // be sent only once, right on subscribe. Creating it late risks losing
+    // that one notification and, under the deviceInfo-gated raw subscribe
+    // below, never subscribing to raw at all for the life of the connection.
+    let mut notifications = peripheral.notifications().await?;
+
     // `raw` is deliberately not in this initial batch. It has no delimiter or
     // checksum, so decoding it requires knowing the channel count from
     // deviceInfo first; it is subscribed lazily below once that arrives.
@@ -159,7 +166,6 @@ pub async fn run(
     let mut stitchers: std::collections::HashMap<Uuid, Stitcher> = Default::default();
     let mut raw_decoder = RawDecoder::default();
     let mut raw_subscribed = false;
-    let mut notifications = peripheral.notifications().await?;
 
     while let Some(n) = notifications.next().await {
         if n.uuid == CHAR_RAW {
