@@ -1,5 +1,8 @@
 use std::fmt;
 use std::sync::Mutex;
+use std::time::Duration;
+
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 const API_KEY: &str = concat!("AIza", "SyB0TkZ83Fj0CIzn8AAmE-Osc92s3ER8hy8");
 const SIGN_IN_URL: &str = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword";
@@ -84,10 +87,26 @@ pub struct KeyringStore {
 
 impl TokenStore for KeyringStore {
     fn load(&self) -> Option<String> {
-        keyring::Entry::new(KEYRING_SERVICE, &self.account)
-            .ok()?
-            .get_password()
-            .ok()
+        // A missing entry is an ordinary cache miss and stays silent; any other
+        // error (locked/inaccessible Keychain) is worth a diagnostic, since it
+        // would otherwise look identical to a miss and re-mint over the network
+        // on every launch with no visible cause.
+        let entry = match keyring::Entry::new(KEYRING_SERVICE, &self.account) {
+            Ok(e) => e,
+            Err(keyring::Error::NoEntry) => return None,
+            Err(e) => {
+                eprintln!("warning: could not read cached Bluetooth token: {e}");
+                return None;
+            }
+        };
+        match entry.get_password() {
+            Ok(p) => Some(p),
+            Err(keyring::Error::NoEntry) => None,
+            Err(e) => {
+                eprintln!("warning: could not read cached Bluetooth token: {e}");
+                None
+            }
+        }
     }
 
     fn save(&self, token: &str) -> Result<(), AuthError> {
@@ -121,13 +140,13 @@ impl TokenStore for MemoryStore {
     }
 }
 
-async fn sign_in(creds: &Credentials) -> Result<String, AuthError> {
+async fn sign_in(creds: &Credentials, client: &reqwest::Client) -> Result<String, AuthError> {
     let body = serde_json::json!({
         "email": creds.email,
         "password": creds.password,
         "returnSecureToken": true,
     });
-    let text = reqwest::Client::new()
+    let text = client
         .post(format!("{SIGN_IN_URL}?key={API_KEY}"))
         .json(&body)
         .send()
@@ -140,9 +159,16 @@ async fn sign_in(creds: &Credentials) -> Result<String, AuthError> {
 }
 
 pub async fn mint_token(creds: &Credentials) -> Result<String, AuthError> {
-    let id_token = sign_in(creds).await?;
+    // A server that accepts the connection and never responds must not hang
+    // the caller forever; an auth round-trip has no legitimate reason to run
+    // longer than this.
+    let client = reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .expect("reqwest client with a timeout is always buildable");
+    let id_token = sign_in(creds, &client).await?;
     let body = serde_json::json!({ "data": { "deviceId": creds.device_id } });
-    let text = reqwest::Client::new()
+    let text = client
         .post(CREATE_TOKEN_URL)
         .bearer_auth(id_token)
         .json(&body)
@@ -162,29 +188,27 @@ fn cache_token(store: &dyn TokenStore, token: &str) {
     }
 }
 
+/// A forced refresh must not read the cache at all, not even to discard it.
+fn cached_token(store: &dyn TokenStore, force_refresh: bool) -> Option<String> {
+    if force_refresh {
+        None
+    } else {
+        store.load()
+    }
+}
+
 /// Returns a cached token when one exists, otherwise mints and caches a new one.
 pub async fn token(
     creds: &Credentials,
     store: &dyn TokenStore,
     force_refresh: bool,
 ) -> Result<String, AuthError> {
-    if !force_refresh {
-        if let Some(t) = store.load() {
-            return Ok(t);
-        }
+    if let Some(t) = cached_token(store, force_refresh) {
+        return Ok(t);
     }
     let t = mint_token(creds).await?;
     cache_token(store, &t);
     Ok(t)
-}
-
-#[tokio::test]
-#[ignore = "requires network and real credentials"]
-async fn live_mint_returns_a_token() {
-    let creds = Credentials::from_env().expect("credentials in environment");
-    let token = mint_token(&creds).await.expect("mint should succeed");
-    assert!(!token.is_empty());
-    println!("token length: {}", token.len());
 }
 
 #[cfg(test)]
@@ -218,6 +242,21 @@ mod tests {
     }
 
     #[test]
+    fn token_response_malformed_json_is_reported() {
+        let err = parse_token_response("not json").unwrap_err();
+        assert!(matches!(err, AuthError::Malformed(_)));
+    }
+
+    #[test]
+    fn token_response_missing_field_is_reported() {
+        // The shape a wrong-region 404 would actually produce: valid JSON,
+        // but no result.token field.
+        let body = r#"{"result":{}}"#;
+        let err = parse_token_response(body).unwrap_err();
+        assert!(format!("{err}").contains("no result.token field"));
+    }
+
+    #[test]
     fn memory_store_round_trips_and_clears() {
         let store = MemoryStore::default();
         assert!(store.load().is_none());
@@ -247,5 +286,44 @@ mod tests {
         // its return type ((), not Result) makes a save failure unable to
         // propagate as an error to the caller. This does not panic.
         cache_token(&FailingStore, "minted-token");
+    }
+
+    fn dummy_credentials() -> Credentials {
+        Credentials {
+            email: "a@b.c".into(),
+            password: "unused".into(),
+            device_id: "device-1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_token_is_returned_without_a_network_call() {
+        let store = MemoryStore::default();
+        store.save("cached-token").unwrap();
+        // force_refresh: false with a populated cache returns before token()
+        // ever reaches mint_token, so this makes no network call even though
+        // the credentials above are not real.
+        let t = token(&dummy_credentials(), &store, false).await.unwrap();
+        assert_eq!(t, "cached-token");
+    }
+
+    #[test]
+    fn force_refresh_bypasses_the_cache() {
+        // This is the exact decision token() makes before ever calling
+        // mint_token; asserting it directly proves force_refresh skips the
+        // cache without requiring a network call to observe it.
+        let store = MemoryStore::default();
+        store.save("cached-token").unwrap();
+        assert_eq!(cached_token(&store, false), Some("cached-token".to_string()));
+        assert_eq!(cached_token(&store, true), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network and real credentials"]
+    async fn live_mint_returns_a_token() {
+        let creds = Credentials::from_env().expect("credentials in environment");
+        let token = mint_token(&creds).await.expect("mint should succeed");
+        assert!(!token.is_empty());
+        println!("token length: {}", token.len());
     }
 }
