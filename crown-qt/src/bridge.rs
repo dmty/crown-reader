@@ -20,6 +20,8 @@ pub mod qobject {
         #[qproperty(f64, calm)]
         #[qproperty(f64, focus)]
         #[qproperty(i32, dropped)]
+        #[qproperty(QString, recording)]
+        #[qproperty(bool, raw)]
         type CrownBridge = super::CrownBridgeRust;
 
         /// Pulls a snapshot and republishes it as Qt properties. Returns
@@ -49,6 +51,18 @@ pub mod qobject {
         /// One channel's decimated envelope as a polyline, scaled to `height`.
         #[qinvokable]
         fn waveform(&self, channel: i32, height: f64) -> QList_QPointF;
+
+        /// Starts a recording against the currently configured device, or
+        /// stops the active one if there is one.
+        #[qinvokable]
+        #[cxx_name = "toggleRecording"]
+        fn toggle_recording(self: Pin<&mut Self>);
+
+        /// Flips the raw-stream choice for the *next* session. Has no effect
+        /// on a session already running — see the method's doc comment.
+        #[qinvokable]
+        #[cxx_name = "toggleRaw"]
+        fn toggle_raw(self: Pin<&mut Self>);
     }
 }
 
@@ -59,6 +73,7 @@ use cxx_qt::CxxQtType;
 use cxx_qt_lib::{QList, QPointF, QString, QStringList};
 
 use crown_core::auth::{Credentials, KeyringStore};
+use crown_core::record::Recorder;
 use crown_core::state::{ConnectionState, Live};
 
 pub struct CrownBridgeRust {
@@ -66,7 +81,10 @@ pub struct CrownBridgeRust {
     calm: f64,
     focus: f64,
     dropped: i32,
+    recording: QString,
+    raw: bool,
     live: Arc<Mutex<Live>>,
+    recorder: Arc<Mutex<Option<Recorder>>>,
     runtime: Option<tokio::runtime::Runtime>,
     handle: Option<tokio::task::JoinHandle<()>>,
     // `None` until the first tick, distinct from a real revision (which
@@ -83,7 +101,10 @@ impl Default for CrownBridgeRust {
             calm: 0.0,
             focus: 0.0,
             dropped: 0,
+            recording: QString::from(""),
+            raw: false,
             live: Arc::new(Mutex::new(Live::new())),
+            recorder: Arc::new(Mutex::new(None)),
             runtime: None,
             handle: None,
             last_rev: None,
@@ -133,14 +154,17 @@ impl qobject::CrownBridge {
 
         let live = self.live.clone();
         let store = Arc::new(KeyringStore { account: creds.email.clone() });
-        let recorder = Arc::new(Mutex::new(None));
+        let recorder = self.recorder.clone();
+        let raw_enabled = self.raw;
         // `supervise` returns `anyhow::Result<()>`; the bridge only ever
         // needs to know whether the task is still running (`is_finished`),
         // not why it ended, so the result is discarded here rather than
         // pulling `anyhow` into this crate just to name the type.
         let handle = self.runtime.as_ref().expect("runtime just ensured present").spawn(
             async move {
-                let _ = crown_core::backoff::supervise(live, creds, store, false, recorder).await;
+                let _ =
+                    crown_core::backoff::supervise(live, creds, store, raw_enabled, recorder)
+                        .await;
             },
         );
         self.as_mut().rust_mut().handle = Some(handle);
@@ -161,6 +185,15 @@ impl qobject::CrownBridge {
         self.as_mut().set_calm(snap.calm as f64);
         self.as_mut().set_focus(snap.focus as f64);
         self.as_mut().set_dropped(snap.dropped_frames as i32);
+        // Derived from `Snapshot.recording`, like every other displayed
+        // value, rather than cached separately: `Live::recording` is the
+        // one place recording start/stop and the transport's clear-on-
+        // failure path (see `ble::clear_recording_indicator`) both write,
+        // so this is the only way the label can't disagree with reality.
+        self.as_mut().set_recording(match &snap.recording {
+            Some(dir) => QString::from(dir.display().to_string()),
+            None => QString::from(""),
+        });
         self.as_mut().rust_mut().snapshot = Some(snap);
         true
     }
@@ -258,4 +291,69 @@ impl qobject::CrownBridge {
         }
         out
     }
+
+    /// Stops the active recording if one is running, otherwise starts one
+    /// against the device `Live` currently has configured.
+    ///
+    /// Never holds `recorder`'s lock and `live`'s lock at the same time —
+    /// each is fully acquired and released before the other is ever taken,
+    /// the same discipline `ble::run` documents and depends on. This
+    /// doesn't just set the bridge's own `recording` property: it writes
+    /// `Live::recording` itself, since that's the one field `tick()` reads
+    /// to publish it (see `tick`'s comment) and the one field the transport
+    /// clears on a disk-write failure. Writing anywhere else would let the
+    /// two disagree.
+    pub fn toggle_recording(self: Pin<&mut Self>) {
+        let mut slot = self.recorder.lock().unwrap();
+        if slot.is_some() {
+            *slot = None; // dropping flushes and closes both writers
+            drop(slot);
+            let mut live = self.live.lock().unwrap();
+            live.recording = None;
+            live.touch();
+            return;
+        }
+        drop(slot);
+
+        let info = {
+            let live = self.live.lock().unwrap();
+            live.device.clone()
+        };
+        let Some(info) = info else {
+            eprintln!("crown-qt: no device info yet, can't start a recording");
+            return;
+        };
+
+        let root = dirs_home().join("CrownSessions");
+        let name = Recorder::session_name();
+        match Recorder::start(&root, &info, &name) {
+            Ok(rec) => {
+                let dir = rec.dir().to_path_buf();
+                *self.recorder.lock().unwrap() = Some(rec);
+                let mut live = self.live.lock().unwrap();
+                live.recording = Some(dir);
+                live.touch();
+            }
+            Err(e) => eprintln!("crown-qt: failed to start recording: {e}"),
+        }
+    }
+
+    /// Flips the raw-stream choice for the *next* session.
+    ///
+    /// `supervise` takes `raw_enabled` by value and reads it once, at spawn
+    /// time, to fix the BLE subscription set for the life of that session;
+    /// it is never re-read. So this has no effect on a session already
+    /// running — QML disables the control while connected so that's never a
+    /// surprise, rather than something a user discovers by watching a flat
+    /// trace.
+    pub fn toggle_raw(mut self: Pin<&mut Self>) {
+        let next = !*self.raw();
+        self.as_mut().set_raw(next);
+    }
+}
+
+fn dirs_home() -> std::path::PathBuf {
+    std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
