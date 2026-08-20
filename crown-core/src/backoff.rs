@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::auth::{Credentials, TokenStore};
 use crate::record::Recorder;
@@ -11,6 +11,16 @@ pub fn backoff_delay(attempt: u32) -> Duration {
     Duration::from_secs(secs.min(30))
 }
 
+/// A run shorter than this is treated as a failure to reconnect even when it
+/// returns `Ok`: a device that connects, authenticates, and then drops the
+/// link right away would otherwise reset `attempt` to 0 every cycle and get
+/// retried every ~1-2s forever — the "always resets hammers a broken device"
+/// case, just laundered through a clean disconnect instead of an error. This
+/// is comfortably above what a real connect+auth round trip costs, so a
+/// session that reaches `Streaming` and runs for any meaningful time still
+/// resets the delay.
+const MIN_SESSION_FOR_RESET: Duration = Duration::from_secs(10);
+
 /// Runs the BLE session forever, reconnecting with backoff.
 ///
 /// `ble::run` returns `Ok(())` only via a clean disconnect (leaving
@@ -20,12 +30,10 @@ pub fn backoff_delay(attempt: u32) -> Duration {
 /// Once `Streaming` is reached, `run` can only return by disconnecting, so
 /// `Streaming` is never the observed state here: checking the `Result` is
 /// the direct signal and reading `Live::connection` afterward would only
-/// recover the same information one step removed. So the delay resets on
-/// `Ok`, not on inferring "reached streaming" from state: this still means
-/// a session that drops before deviceInfo ever arrives resets the counter
-/// too, but that is a real (if early) disconnect, not the kind of
-/// persistent problem (bad credentials, no adapter, device unreachable)
-/// that `Err` represents — and only `Err` climbs the backoff.
+/// recover the same information one step removed. `Err` always climbs the
+/// backoff. `Ok` resets it too, but only if the run lasted at least
+/// `MIN_SESSION_FOR_RESET` — see that constant's doc comment for why a bare
+/// `Ok` is not enough on its own.
 pub async fn supervise(
     live: Arc<Mutex<Live>>,
     creds: Credentials,
@@ -42,6 +50,7 @@ pub async fn supervise(
             password: creds.password.clone(),
             device_id: creds.device_id.clone(),
         };
+        let started = Instant::now();
         let result = crate::ble::run(
             live.clone(),
             creds_clone,
@@ -50,6 +59,7 @@ pub async fn supervise(
             recorder.clone(),
         )
         .await;
+        let ran_long_enough = started.elapsed() >= MIN_SESSION_FOR_RESET;
 
         // Logged before the state flips to Reconnecting below, so a human
         // watching stderr can tell a failure-triggered retry from a clean-
@@ -66,7 +76,7 @@ pub async fn supervise(
             l.touch();
         }
 
-        attempt = if result.is_ok() { 0 } else { attempt + 1 };
+        attempt = if result.is_ok() && ran_long_enough { 0 } else { attempt + 1 };
         tokio::time::sleep(backoff_delay(attempt)).await;
     }
 }
