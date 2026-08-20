@@ -55,6 +55,19 @@ async fn characteristic(
         .ok_or_else(|| anyhow!("characteristic {uuid} not found on device"))
 }
 
+/// Parses `line` as `T` and applies it to `Live` via `apply` on success.
+/// Returns whether the parse succeeded; callers count a `false` as a
+/// dropped frame rather than treating it as fatal.
+fn apply_json<T: serde::de::DeserializeOwned>(line: &str, apply: impl FnOnce(T)) -> bool {
+    match serde_json::from_str(line) {
+        Ok(v) => {
+            apply(v);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Writes `jwt` to the auth characteristic.
 ///
 /// A single write is tried first. If it fails with what looks like a length
@@ -192,36 +205,26 @@ pub async fn run(
             {
                 let mut l = live.lock().unwrap();
                 let parsed = match n.uuid {
-                    CHAR_DEVICE_INFO => serde_json::from_str::<DeviceInfo>(&line)
-                        .map(|d| {
-                            l.configure(d);
-                            device_info_configured = true;
-                        })
-                        .is_ok(),
-                    CHAR_POWER_BY_BAND => serde_json::from_str::<PowerByBand>(&line)
-                        .map(|b| {
-                            l.bands = Some(b);
-                            l.touch();
-                        })
-                        .is_ok(),
-                    CHAR_CALM => serde_json::from_str::<Awareness>(&line)
-                        .map(|a| {
-                            l.calm = a.probability as f32;
-                            l.touch();
-                        })
-                        .is_ok(),
-                    CHAR_FOCUS => serde_json::from_str::<Awareness>(&line)
-                        .map(|a| {
-                            l.focus = a.probability as f32;
-                            l.touch();
-                        })
-                        .is_ok(),
-                    CHAR_SIGNAL_QUALITY => serde_json::from_str::<SignalQuality>(&line)
-                        .map(|q| {
-                            l.quality = q;
-                            l.touch();
-                        })
-                        .is_ok(),
+                    CHAR_DEVICE_INFO => apply_json(&line, |d: DeviceInfo| {
+                        l.configure(d);
+                        device_info_configured = true;
+                    }),
+                    CHAR_POWER_BY_BAND => apply_json(&line, |b: PowerByBand| {
+                        l.bands = Some(b);
+                        l.touch();
+                    }),
+                    CHAR_CALM => apply_json(&line, |a: Awareness| {
+                        l.calm = a.probability as f32;
+                        l.touch();
+                    }),
+                    CHAR_FOCUS => apply_json(&line, |a: Awareness| {
+                        l.focus = a.probability as f32;
+                        l.touch();
+                    }),
+                    CHAR_SIGNAL_QUALITY => apply_json(&line, |q: SignalQuality| {
+                        l.quality = q;
+                        l.touch();
+                    }),
                     _ => true,
                 };
                 if !parsed {
