@@ -6,3 +6,4 @@ pub mod ring;
 pub mod state;
 pub mod auth;
 pub mod ble;
+pub mod record;
