@@ -179,7 +179,7 @@ async fn next_or_disconnected(
 /// Connects, authenticates, subscribes, and pumps notifications into `live`
 /// until the connection drops. Returns `Ok(())` on a clean disconnect.
 ///
-/// This is a thin wrapper around [`try_run`] whose only job is to make sure
+/// This is a thin wrapper around `try_run` whose only job is to make sure
 /// `Live::connection` reflects a `Failed` state on *any* error return —
 /// scan failure, connect failure, subscribe failure, auth rejection, all of
 /// it — rather than leaving it at whatever the last successful step set.
