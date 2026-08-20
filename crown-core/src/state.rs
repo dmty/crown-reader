@@ -211,7 +211,15 @@ mod tests {
         assert!(snap.waveform[0].is_empty());
         assert!(snap.waveform[1].is_empty());
 
-        live.push_raw(&RawSample { timestamp: 4, marker: 0, data: vec![1.0, 2.0] });
+        // 1e300 is itself a finite f64 — `is_finite()` on the raw sample would
+        // let it through — but `as f32` saturates it to +inf, so the guard
+        // must check finiteness on the cast value that actually reaches the
+        // ring, not on the wire value.
+        live.push_raw(&RawSample { timestamp: 4, marker: 0, data: vec![1e300, 1.0] });
+        assert_eq!(live.snapshot(10).dropped_frames, 4);
+        assert!(live.snapshot(10).waveform[0].is_empty());
+
+        live.push_raw(&RawSample { timestamp: 5, marker: 0, data: vec![1.0, 2.0] });
         assert!(!live.snapshot(10).waveform[0].is_empty());
     }
 }
