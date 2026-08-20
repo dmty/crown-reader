@@ -44,16 +44,37 @@ const AUTH_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// waiting a few extra seconds.
 const DEVICE_INFO_TIMEOUT: Duration = Duration::from_secs(15);
 
-// These two bounds cover the auth read and the deviceInfo wait
-// specifically — they are not a general guarantee that `Authenticating`
-// (or any other state) is bounded. `connect()`, `discover_services()`,
-// `write_jwt`'s `p.write()`, and every `subscribe()` call below are the
-// same kind of unbounded btleplug await, with the same "only a value or a
-// disconnect resolves it, nothing else" shape, and none of them have a
-// timeout here. A device that acknowledges the connection but never
-// completes one of those calls still hangs the session indefinitely. Known
-// limitation, not addressed in this round — adding timeouts to every
-// btleplug call is a larger change than fits here.
+/// Bound on `Peripheral::disconnect()`, called on every exit from
+/// `try_run`. Not the same class of "device is slow" timeout as the two
+/// above — this one exists because btleplug 0.12's CoreBluetooth backend
+/// has a real gap, not because a real disconnect can legitimately take
+/// this long. `disconnect_peripheral` in btleplug's internal event loop is
+/// `if let Some(p) = self.peripherals.get_mut(...) { ... }` with **no
+/// `else` branch** — contrast `is_connected`'s handler in the same file,
+/// which does have one, with a comment naming exactly this hazard
+/// ("rather than hanging the future forever"). A device-initiated
+/// disconnect (the headset switching off) reaches that same internal map
+/// first via `on_peripheral_disconnect`, which removes the entry *before*
+/// our own `disconnect()` call can run — so the reply future our call
+/// awaits is never fulfilled, and a bare `.await` hangs forever on exactly
+/// the "headset switched off" path the reconnect supervisor exists to
+/// recover from. A short timeout, with expiry treated as success (the
+/// peripheral already being gone is exactly the case that hangs), is the
+/// only way to bound this without patching btleplug itself. Do not delete
+/// this timeout as unneeded caution — it is load-bearing.
+const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+// These bounds cover the auth read, the deviceInfo wait, and the
+// disconnect specifically — they are not a general guarantee that
+// `Authenticating` (or any other state) is bounded. `connect()`,
+// `discover_services()`, `write_jwt`'s `p.write()`, and every
+// `subscribe()` call below are the same kind of unbounded btleplug await,
+// with the same "only a value or a disconnect resolves it, nothing else"
+// shape, and none of them have a timeout here. A device that acknowledges
+// the connection but never completes one of those calls still hangs the
+// session indefinitely. Known limitation, not addressed in this round —
+// adding timeouts to every btleplug call is a larger change than fits
+// here.
 
 /// Builds the one `Adapter` a caller should hold for the life of a
 /// reconnecting session, rather than a fresh one per attempt.
@@ -76,8 +97,44 @@ pub async fn first_adapter() -> Result<Adapter> {
         .ok_or_else(|| anyhow!("no Bluetooth adapter available"))
 }
 
+/// Clears `adapter`'s btleplug-internal peripheral cache before a scan.
+///
+/// Needed only because `adapter` is now reused across every reconnect
+/// attempt (see `first_adapter`) rather than rebuilt fresh each time.
+/// btleplug's `AdapterManager` — the cache backing `adapter.peripherals()`
+/// — removes an entry when a peripheral actually disconnects or the
+/// adapter powers off (both dispatch a `DeviceDisconnected` event that
+/// `AdapterManager::emit` acts on), but *not* when a connection attempt
+/// simply fails: the CoreBluetooth backend's
+/// `on_peripheral_connection_failed` only fails the pending `connect()`
+/// future, it never dispatches any disconnect event. A peripheral that
+/// fails to connect once — an ordinary, common occurrence on real
+/// hardware, not a bug — therefore stays cached forever on a reused
+/// adapter. The next time it's rediscovered, `AdapterManager`'s
+/// `add_peripheral` does `assert!(!self.peripherals.contains_key(...),
+/// "Adding a peripheral that's already in the map.")`, which panics
+/// btleplug's own background event-pump task — silently breaking every
+/// future scan and connect on this adapter, with no error surfaced to us.
+/// A fresh adapter per attempt (the old, leaking shape) never hit this,
+/// since its cache started empty every time; reuse is what exposed it.
+/// `clear_peripherals` exists on the `Central` trait specifically for
+/// this and is never called internally by btleplug itself. Best-effort: a
+/// failure here is logged, not propagated — the scan that follows can
+/// still succeed against whatever the cache already holds, and failing
+/// the whole attempt over a cache-clear error would be worse than the
+/// (still merely possible, not certain) assert this is guarding against.
+async fn clear_stale_cache(adapter: &Adapter) {
+    if let Err(e) = adapter.clear_peripherals().await {
+        eprintln!("warning: failed to clear the Bluetooth adapter's peripheral cache: {e}");
+    }
+}
+
 /// Scans for a headset by advertised name. The service UUID is not used as a
 /// scan filter because the device does not reliably advertise it.
+///
+/// Clears `adapter`'s peripheral cache before every scan — see
+/// `clear_stale_cache`'s doc comment for why a reused adapter needs this and
+/// a fresh one never did.
 ///
 /// Always stops the scan before returning, on every exit path including an
 /// error from `adapter.peripherals()`/`p.properties()` partway through —
@@ -91,6 +148,7 @@ pub async fn first_adapter() -> Result<Adapter> {
 /// correctness bug — but there is no reason to lean on that tolerance when
 /// stopping cleanly is this cheap.
 pub async fn find_crown(adapter: &Adapter) -> Result<Peripheral> {
+    clear_stale_cache(adapter).await;
     adapter.start_scan(ScanFilter::default()).await?;
     let result = scan_for_crown(adapter).await;
     if let Err(e) = adapter.stop_scan().await {
@@ -444,15 +502,24 @@ async fn try_run(
     // the link: the Crown accepts only one connection at a time, and
     // btleplug 0.12's CoreBluetooth backend has no `Drop` impl on
     // `Peripheral` to do this automatically (see `first_adapter`'s doc
-    // comment for the adapter side of the same class of leak). Best-effort:
-    // a disconnect failure is logged and never allowed to replace the real
-    // result from `stream_session` — `run`'s caller needs that result to
-    // classify the failure and decide whether to retry.
+    // comment for the adapter side of the same class of leak). Best-effort
+    // and time-bounded (see `DISCONNECT_TIMEOUT`'s doc comment): a
+    // disconnect failure — or a timeout, which is the *expected* shape of
+    // "the headset already disconnected itself" — is logged and never
+    // allowed to replace the real result from `stream_session`; `run`'s
+    // caller needs that result to classify the failure and decide whether
+    // to retry.
     let result =
         stream_session(&peripheral, live.clone(), creds, store, raw_enabled, recorder, &set)
             .await;
-    if let Err(e) = peripheral.disconnect().await {
-        eprintln!("warning: failed to disconnect from the headset: {e}");
+    match tokio::time::timeout(DISCONNECT_TIMEOUT, peripheral.disconnect()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("warning: failed to disconnect from the headset: {e}"),
+        Err(_) => {
+            // Expected, not a failure: see `DISCONNECT_TIMEOUT`'s doc
+            // comment for why btleplug never resolves this future when the
+            // peripheral disconnected on its own first.
+        }
     }
     result
 }
