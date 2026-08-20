@@ -5,7 +5,6 @@ Item {
     id: root
     required property var bridge
     required property int channel
-    property int rev: 0
 
     implicitHeight: 60
 
@@ -17,7 +16,11 @@ Item {
 
     Shape {
         anchors.fill: parent
-        preferredRendererType: Shape.CurveRenderer
+        // GeometryRenderer, not CurveRenderer: this path is a plain
+        // polyline (min/max zigzag, no curves), and CurveRenderer
+        // re-triangulates on the UI thread on every repaint — needless cost
+        // at ~1800 points/channel and 30Hz.
+        preferredRendererType: Shape.GeometryRenderer
 
         ShapePath {
             strokeColor: "#4a90d9"
@@ -25,7 +28,10 @@ Item {
             fillColor: "transparent"
 
             PathPolyline {
-                path: (root.rev, root.bridge.waveform(root.channel, root.height))
+                path: {
+                    root.bridge.rev; // re-read on every tick bump; waveform() is an invokable, not a bound property
+                    return root.bridge.waveform(root.channel, root.height);
+                }
             }
         }
     }
