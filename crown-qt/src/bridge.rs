@@ -3,6 +3,9 @@ pub mod qobject {
     unsafe extern "C++" {
         include!("cxx-qt-lib/qstring.h");
         type QString = cxx_qt_lib::QString;
+
+        include!("cxx-qt-lib/qstringlist.h");
+        type QStringList = cxx_qt_lib::QStringList;
     }
 
     extern "RustQt" {
@@ -21,6 +24,19 @@ pub mod qobject {
         /// Starts the BLE supervisor. Safe to call more than once.
         #[qinvokable]
         fn start(self: Pin<&mut Self>);
+
+        /// Channel names in device order, for QML to iterate against `quality`.
+        #[qinvokable]
+        fn channels(&self) -> QStringList;
+
+        /// Contact-quality label for the channel at `channel`'s position in
+        /// `channels()`.
+        #[qinvokable]
+        fn quality(&self, channel: i32) -> QString;
+
+        /// Mean power across channels for the named band.
+        #[qinvokable]
+        fn band(&self, name: &QString) -> f64;
     }
 }
 
@@ -28,7 +44,7 @@ use core::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use cxx_qt::CxxQtType;
-use cxx_qt_lib::QString;
+use cxx_qt_lib::{QString, QStringList};
 
 use crown_core::auth::{Credentials, KeyringStore};
 use crown_core::state::{ConnectionState, Live};
@@ -42,6 +58,7 @@ pub struct CrownBridgeRust {
     runtime: Option<tokio::runtime::Runtime>,
     handle: Option<tokio::task::JoinHandle<()>>,
     last_rev: u64,
+    snapshot: Option<crown_core::state::Snapshot>,
 }
 
 impl Default for CrownBridgeRust {
@@ -55,6 +72,7 @@ impl Default for CrownBridgeRust {
             runtime: None,
             handle: None,
             last_rev: 0,
+            snapshot: None,
         }
     }
 }
@@ -128,5 +146,49 @@ impl qobject::CrownBridge {
         self.as_mut().set_calm(snap.calm as f64);
         self.as_mut().set_focus(snap.focus as f64);
         self.as_mut().set_dropped(snap.dropped_frames as i32);
+        self.as_mut().rust_mut().snapshot = Some(snap);
+    }
+
+    pub fn channels(&self) -> QStringList {
+        let mut list = QStringList::default();
+        if let Some(s) = &self.snapshot {
+            for name in &s.channel_names {
+                list.append(QString::from(name));
+            }
+        }
+        list
+    }
+
+    pub fn quality(&self, channel: i32) -> QString {
+        let Some(s) = &self.snapshot else {
+            return QString::from("unknown");
+        };
+        let Some(name) = s.channel_names.get(channel.max(0) as usize) else {
+            return QString::from("unknown");
+        };
+        match s.quality.get(name) {
+            Some(q) => QString::from(&format!("{:?}", q.status)),
+            None => QString::from("unknown"),
+        }
+    }
+
+    /// Mean power across channels for one band. QML asks by name so adding a
+    /// band later needs no bridge change.
+    pub fn band(&self, name: &QString) -> f64 {
+        let Some(s) = &self.snapshot else { return 0.0 };
+        let Some(b) = &s.bands else { return 0.0 };
+        let values = match name.to_string().as_str() {
+            "delta" => &b.delta,
+            "theta" => &b.theta,
+            "alpha" => &b.alpha,
+            "beta" => &b.beta,
+            "gamma" => &b.gamma,
+            _ => return 0.0,
+        };
+        if values.is_empty() {
+            0.0
+        } else {
+            values.iter().sum::<f64>() / values.len() as f64
+        }
     }
 }

@@ -16,7 +16,10 @@ ApplicationWindow {
         interval: 33
         running: true
         repeat: true
-        onTriggered: crown.tick(content.width)
+        onTriggered: {
+            crown.tick(content.width);
+            metrics.rev++;
+        }
     }
 
     Column {
@@ -25,9 +28,11 @@ ApplicationWindow {
         spacing: 12
 
         Text { text: "Status: " + crown.connection; font.pixelSize: 20 }
-        Text { text: "Calm: " + crown.calm.toFixed(2) }
-        Text { text: "Focus: " + crown.focus.toFixed(2) }
-        Text { text: "Dropped: " + crown.dropped }
+
+        Metrics {
+            id: metrics
+            bridge: crown
+        }
 
         Button {
             text: "Connect"
