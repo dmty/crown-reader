@@ -86,16 +86,12 @@ ApplicationWindow {
                     // would silently do nothing to that session. Disabled here
                     // rather than left clickable-but-inert.
                     //
-                    // A blacklist of the actively-running states, not a
-                    // whitelist of "Disconnected"/"Failed": `start()` can also
-                    // leave `connection` holding a raw error string (e.g. a
-                    // missing-env-var message) on a path that never touches
-                    // `Live`, so a whitelist would strand the toggle disabled
-                    // forever after a credential error. Anything not in this
-                    // list — including that error string — means no session is
-                    // running.
-                    enabled: ["Scanning", "Connecting", "Authenticating", "Streaming", "Reconnecting"]
-                        .indexOf(crown.connection) === -1
+                    // `crown.active` is `ConnectionState::is_active()`
+                    // republished, not a string match against `connection`:
+                    // matching against `label()`'s output here would silently
+                    // break if that mapping ever changed, with no compiler
+                    // error to catch it.
+                    enabled: !crown.active
                     onClicked: crown.toggleRaw()
                 }
             }

@@ -31,6 +31,18 @@ pub enum ConnectionState {
     Failed,
 }
 
+impl ConnectionState {
+    /// Whether a BLE session (the task `supervise` spawns) is actually
+    /// running. `Disconnected` and `Failed` are the only idle states — the
+    /// initial, never-connected state, and where a terminal error (or a
+    /// fresh `Live`) leaves things once the task has ended — so this is
+    /// their negation rather than a whitelist of the running states: a
+    /// value this doesn't recognize should read as active, not idle.
+    pub fn is_active(self) -> bool {
+        !matches!(self, ConnectionState::Disconnected | ConnectionState::Failed)
+    }
+}
+
 /// The complete core-to-UI contract. Contains no UI types by design.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -193,6 +205,17 @@ mod tests {
             channel_names: (0..channels).map(|i| format!("CH{i}")).collect(),
             channels,
             sampling_rate: 256.0,
+        }
+    }
+
+    #[test]
+    fn is_active_is_false_only_for_the_two_idle_states() {
+        use ConnectionState::*;
+        for s in [Scanning, Connecting, Authenticating, Streaming, Reconnecting] {
+            assert!(s.is_active(), "{s:?} should be active");
+        }
+        for s in [Disconnected, Failed] {
+            assert!(!s.is_active(), "{s:?} should be idle");
         }
     }
 
