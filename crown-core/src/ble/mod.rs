@@ -410,12 +410,12 @@ async fn next_or_disconnected(
 /// `Some` to turn recording on mid-session and back to `None` to turn it
 /// off, without needing to restart the connection. This is stronger than a
 /// consistent lock order: everywhere below that touches both, one guard is
-/// fully acquired *and released* before the other is ever taken — `live`
-/// then `recorder` when pushing a sample, `recorder` then `live` when a
-/// write failure needs `Live::recording` cleared to match — so the two
+/// fully acquired *and released* before the other is ever taken — `live` then
+/// `recorder` when recording a derived-metric line, `recorder` then `live`
+/// when a write failure needs `Live::recording` cleared to match — so the two
 /// locks are never held at the same time in either direction. There is no
-/// ordering for a caller elsewhere (e.g. a future UI thread) to invert into
-/// a cycle, because there is no window in which this code holds one while
+/// ordering for a caller elsewhere (e.g. a future UI thread) to invert into a
+/// cycle, because there is no window in which this code holds one while
 /// waiting on the other. Neither lock is ever held across an `.await`.
 pub async fn run(
     adapter: &Adapter,

@@ -69,17 +69,8 @@ fn char_name(uuid: Uuid) -> &'static str {
     CHAR_NAMES.iter().find(|(u, _)| *u == uuid).map(|(_, n)| *n).unwrap_or("UNKNOWN")
 }
 
-/// Whether the transport probes should report.
-fn raw_debug() -> bool {
-    std::env::var_os("CROWN_RAW_DEBUG").is_some()
-}
-
 /// Lag of the JSON metric path, printed every 8th `calm` update when
 /// `CROWN_RAW_DEBUG` is set.
-///
-/// Raw and the metric streams share one link, so this answers a question the
-/// raw probe cannot: whether enabling raw also delays the numbers the reader
-/// actually displays. Run once with `--raw` and once without to compare.
 pub struct MetricProbe {
     enabled: bool,
     count: usize,
@@ -88,7 +79,7 @@ pub struct MetricProbe {
 impl MetricProbe {
     pub fn new() -> Self {
         Self {
-            enabled: raw_debug(),
+            enabled: std::env::var_os("CROWN_RAW_DEBUG").is_some(),
             count: 0,
         }
     }
