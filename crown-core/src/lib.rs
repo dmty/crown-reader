@@ -10,3 +10,4 @@ pub mod ble;
 pub mod record;
 pub mod sync;
 pub mod filter;
+pub mod osc;
