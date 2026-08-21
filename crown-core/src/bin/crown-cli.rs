@@ -80,7 +80,8 @@ async fn main() {
             // screen, not a verdict — one blink latches it high for 10s.
             //
             // A slowly climbing `dropped` is that same ~2% loss and expected;
-            // a fast climb instead points at a decode or channel-count fault.
+            // a fast climb instead points at a decode or channel-count fault
+            // — or a real network stall, which climbs exactly the same way.
             let raw_rate = snap.raw_samples - last_raw_samples;
             last_raw_samples = snap.raw_samples;
             let extent = snap.waveform.first().and_then(|cols| {

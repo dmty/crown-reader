@@ -106,10 +106,12 @@ ApplicationWindow {
                     // the next `start()` will use, and the label says so;
                     // active, `tick()` overwrites it with what the transport
                     // actually did (see bridge.rs), so the same property
-                    // reads as current status instead — including going
-                    // "off" for a few seconds while a session that will
-                    // succeed is still scanning/connecting/authenticating,
-                    // before the raw subscribe has had a chance to land.
+                    // reads as current status instead. `raw_enabled` is set
+                    // before the BLE state machine ever leaves `Disconnected`
+                    // (see backoff.rs), so unlike the old BLE-notification
+                    // path there is no startup window to wait out here: "Raw:
+                    // off" once active means the OSC listener already failed
+                    // to bind, not that it hasn't landed yet.
                     text: crown.active
                         ? (crown.raw ? "Raw: on" : "Raw: off")
                         : (crown.raw ? "Raw (next session): on" : "Raw (next session): off")
