@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -173,6 +174,76 @@ async fn scan_for_crown(adapter: &Adapter) -> Result<Peripheral> {
     Err(anyhow!("no Crown or Notion device found within 10 seconds"))
 }
 
+/// Prints every service and characteristic the device exposes, with its
+/// properties, when `CROWN_GATT_DUMP` is set. Marks the seven UUIDs this
+/// crate knows so anything unrecognised stands out.
+///
+/// The seven were taken from a fragment of the vendor SDK; the device has
+/// never been asked directly what else it offers. A lower-rate or
+/// lower-channel-count variant of the raw stream would show up here, and
+/// would matter a great deal — the full raw stream needs four times the
+/// bandwidth this link delivers.
+fn dump_gatt(p: &Peripheral) {
+    if std::env::var_os("CROWN_GATT_DUMP").is_none() {
+        return;
+    }
+    let mut characteristics: Vec<_> = p.characteristics().into_iter().collect();
+    characteristics.sort_by_key(|c| (c.service_uuid, c.uuid));
+
+    eprintln!("gatt dump: {} characteristics", characteristics.len());
+    let mut service = None;
+    for c in characteristics {
+        if service != Some(c.service_uuid) {
+            eprintln!("  service {}", c.service_uuid);
+            service = Some(c.service_uuid);
+        }
+        let name = any_name(c.uuid);
+        eprintln!("    {} [{:?}] {name}", c.uuid, c.properties);
+    }
+}
+
+/// The seven characteristics this crate was built against. The device
+/// exposes far more; `dump_gatt` and `UnknownProbe` exist to identify the
+/// rest.
+const KNOWN_CHARS: [(Uuid, &str); 7] = [
+    (CHAR_AUTH, "auth"),
+    (CHAR_DEVICE_INFO, "deviceInfo"),
+    (CHAR_RAW, "raw"),
+    (CHAR_POWER_BY_BAND, "powerByBand"),
+    (CHAR_FOCUS, "focus"),
+    (CHAR_CALM, "calm"),
+    (CHAR_SIGNAL_QUALITY, "signalQuality"),
+];
+
+fn known_name(uuid: Uuid) -> Option<&'static str> {
+    KNOWN_CHARS.iter().find(|(u, _)| *u == uuid).map(|(_, n)| *n)
+}
+
+/// The ten characteristics the vendor SDK names that this crate does not
+/// consume. Display only — naming them makes probe output readable without
+/// implying anything is subscribed or decoded.
+const UNCONSUMED_CHARS: [(Uuid, &str); 10] = [
+    (Uuid::from_u128(0xd7e84cb2_ff37_4afc_9ed8_5577aeb84542), "deviceId"),
+    (Uuid::from_u128(0xd2e4b9e7_ab9d_4806_88a3_58584c1cf02b), "action"),
+    (Uuid::from_u128(0x1defa07f_2d1c_4e55_b981_eedabba7ae2b), "status"),
+    (Uuid::from_u128(0x014975ce_50df_4bfb_8ed4_a3437d619268), "settings"),
+    (Uuid::from_u128(0x84501dee_8665_4073_b111_bdecd69fb489), "accelerometer"),
+    (Uuid::from_u128(0x902ac5f3_ce59_4c11_94fa_437e89f90630), "signalQualityV2"),
+    (Uuid::from_u128(0x5472432e_3313_4169_add8_6fcb29accb0e), "rawUnfiltered"),
+    (Uuid::from_u128(0xd6684fb0_8518_40c0_8e88_4634e762435d), "psd"),
+    (Uuid::from_u128(0xf1cd519b_07dc_4f33_a285_286db2393359), "wifiNearbyNetworks"),
+    (Uuid::from_u128(0x37b2ce69_6fac_4547_91f3_8f1c527b875d), "wifiConnections"),
+];
+
+/// Name from either table, for display in the probes.
+fn any_name(uuid: Uuid) -> &'static str {
+    known_name(uuid)
+        .or_else(|| {
+            UNCONSUMED_CHARS.iter().find(|(u, _)| *u == uuid).map(|(_, n)| *n)
+        })
+        .unwrap_or("UNKNOWN")
+}
+
 async fn characteristic(
     p: &Peripheral,
     uuid: Uuid,
@@ -186,6 +257,169 @@ async fn characteristic(
 /// Parses `line` as `T` and applies it to `Live` via `apply` on success.
 /// Returns whether the parse succeeded; callers count a `false` as a
 /// dropped frame rather than treating it as fatal.
+/// Lag of the JSON metric path, printed every 8th `calm` update when
+/// `CROWN_RAW_DEBUG` is set.
+///
+/// Raw and the metric streams share one link, so this answers a question the
+/// raw probe cannot: whether enabling raw also delays the numbers the reader
+/// actually displays. Run once with `--raw` and once without to compare.
+struct MetricProbe {
+    enabled: bool,
+    count: usize,
+}
+
+impl MetricProbe {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("CROWN_RAW_DEBUG").is_some(),
+            count: 0,
+        }
+    }
+
+    fn observe(&mut self, timestamp_ms: f64) {
+        if !self.enabled {
+            return;
+        }
+        self.count += 1;
+        if !self.count.is_multiple_of(8) {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0);
+        eprintln!("metric probe: calm lag={:.0}ms", now - timestamp_ms);
+    }
+}
+
+/// Diagnostic for the raw stream's cadence, off unless `CROWN_RAW_DEBUG` is
+/// set. Reports every 600 samples.
+///
+/// The per-second sample rate alone cannot distinguish a device that
+/// decimates from a link too slow to carry the full stream. These two ratios
+/// separate them:
+///
+/// - `device_span / wall_span` — 1.0 means the stream keeps pace with real
+///   time. Below 1.0 the device is producing faster than the link delivers,
+///   so a backlog is building.
+/// - `lag` — how far the newest delivered sample sits behind the host clock.
+///   Growing lag confirms an unbounded backlog; lag that plateaus means the
+///   device is dropping to stay current, which would also show up as gaps in
+///   the timestamp deltas.
+struct RawProbe {
+    enabled: bool,
+    reported_once: bool,
+    first: Vec<u64>,
+    prev: Option<u64>,
+    deltas: HashMap<i128, usize>,
+    notifications: HashMap<(usize, usize), usize>,
+    count: usize,
+    window_start: Instant,
+    window_first_timestamp: Option<u64>,
+}
+
+/// Samples per report in steady state: ~9s at the rate the link delivers.
+const PROBE_WINDOW: usize = 600;
+
+impl RawProbe {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("CROWN_RAW_DEBUG").is_some(),
+            reported_once: false,
+            first: Vec::new(),
+            prev: None,
+            deltas: HashMap::new(),
+            notifications: HashMap::new(),
+            count: 0,
+            window_start: Instant::now(),
+            window_first_timestamp: None,
+        }
+    }
+
+
+    fn observe(&mut self, payload_len: usize, samples: &[RawSample]) {
+        if !self.enabled {
+            return;
+        }
+        *self.notifications.entry((payload_len, samples.len())).or_default() += 1;
+        for s in samples {
+            if self.first.len() < 8 {
+                self.first.push(s.timestamp);
+            }
+            if self.window_first_timestamp.is_none() {
+                self.window_first_timestamp = Some(s.timestamp);
+            }
+            if let Some(p) = self.prev {
+                // Signed: a decode desync or a device clock step can run
+                // backwards, and that is worth seeing rather than wrapping.
+                *self.deltas.entry(s.timestamp as i128 - p as i128).or_default() += 1;
+            }
+            self.prev = Some(s.timestamp);
+            self.count += 1;
+        }
+        if self.count >= PROBE_WINDOW {
+            self.report();
+            self.reset();
+        }
+    }
+
+    fn report(&mut self) {
+        let wall = self.window_start.elapsed().as_secs_f64();
+        let device = match (self.window_first_timestamp, self.prev) {
+            (Some(first), Some(last)) => (last.saturating_sub(first)) as f64 / 1000.0,
+            _ => 0.0,
+        };
+        // Device and host clocks are both wall-clock epochs here, so the
+        // difference is meaningful. Any fixed offset between them cancels
+        // out of the trend, which is the part that matters.
+        let lag = self.prev.map(|last| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i128 - last as i128)
+                .unwrap_or(0)
+        });
+
+        let mut deltas: Vec<_> = self.deltas.iter().collect();
+        deltas.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
+
+        eprintln!(
+            "raw probe: {} samples, {:.1}s device / {:.1}s wall = {:.2}x realtime, lag={:?}ms",
+            self.count,
+            device,
+            wall,
+            if wall > 0.0 { device / wall } else { 0.0 },
+            lag,
+        );
+        eprintln!(
+            "  deltas x count: {:?}  min={:?} max={:?} distinct={}",
+            &deltas[..deltas.len().min(6)],
+            self.deltas.keys().min(),
+            self.deltas.keys().max(),
+            self.deltas.len()
+        );
+        if !self.reported_once {
+            let mut notifications: Vec<_> = self.notifications.iter().collect();
+            notifications.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
+            eprintln!("  first timestamps: {:?}", self.first);
+            eprintln!(
+                "  (payload_bytes, samples_decoded) x count: {:?}",
+                &notifications[..notifications.len().min(6)]
+            );
+            self.reported_once = true;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.count = 0;
+        self.deltas.clear();
+        self.notifications.clear();
+        self.window_start = Instant::now();
+        // Deliberately keeps `prev`: the gap between windows is a real
+        // interval and dropping it would hide a stall at the seam.
+        self.window_first_timestamp = self.prev;
+    }
+}
+
 fn apply_json<T: serde::de::DeserializeOwned>(line: &str, apply: impl FnOnce(T)) -> bool {
     match serde_json::from_str(line) {
         Ok(v) => {
@@ -544,6 +778,7 @@ async fn stream_session(
     set(ConnectionState::Connecting);
     peripheral.connect().await?;
     peripheral.discover_services().await?;
+    dump_gatt(peripheral);
 
     set(ConnectionState::Authenticating);
     let mut jwt = token(&creds, store.as_ref(), false).await?;
@@ -709,6 +944,8 @@ async fn stream_session(
     // through this loop is contended with the UI/CLI thread's `snapshot()`
     // call, so a slow render is itself a contributor to notification lag.
     let mut raw_decoder = RawDecoder::default();
+    let mut raw_probe = RawProbe::new();
+    let mut metric_probe = MetricProbe::new();
 
     loop {
         let Some(n) = next_or_disconnected(&mut notifications, peripheral, &mut liveness).await
@@ -727,6 +964,7 @@ async fn stream_session(
                 continue;
             }
             let samples = raw_decoder.push(&n.value, channels);
+            raw_probe.observe(n.value.len(), &samples);
             {
                 let mut l = crate::sync::lock(&live);
                 for s in &samples {
@@ -751,6 +989,7 @@ async fn stream_session(
                     CHAR_CALM => apply_json(&line, |a: Awareness| {
                         l.calm = a.probability as f32;
                         l.touch();
+                        metric_probe.observe(a.timestamp);
                     }),
                     CHAR_FOCUS => apply_json(&line, |a: Awareness| {
                         l.focus = a.probability as f32;
