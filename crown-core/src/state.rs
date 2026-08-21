@@ -204,6 +204,9 @@ impl Live {
         self.rev
     }
 
+    /// Runs with the caller holding the `Live` mutex — the same one the BLE
+    /// metric loop and the OSC listener take on every notification, so a
+    /// slow render here is itself a contributor to notification lag.
     pub fn snapshot(&self, width_px: usize) -> Snapshot {
         Snapshot {
             connection: self.connection,

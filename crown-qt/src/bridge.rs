@@ -118,9 +118,8 @@ pub struct CrownBridgeRust {
     // (`Snapshot::raw_enabled`) while a session is active, `raw_requested`
     // while idle — see `tick()`. Never read by `start()`; `raw_requested`
     // below is the actual source of truth for what the next session asks
-    // for, so that an active-phase outcome (e.g. `false`, because the
-    // subscribe hasn't happened yet, or the session failed before it could)
-    // can never overwrite what the user asked for.
+    // for, so a stale outcome left behind by a session that already ended
+    // (or never started) can never overwrite what the user asked for.
     raw: bool,
     active: bool,
     ready: bool,
@@ -133,9 +132,8 @@ pub struct CrownBridgeRust {
     // The user's actual pending choice for the *next* session, set only by
     // `toggle_raw`. This is what `start()` reads — never the `raw` property,
     // which `tick()` overwrites with the current session's outcome while
-    // active and would otherwise clobber a request the user made before a
-    // session that then failed early (before the raw subscribe was ever
-    // attempted, `Live::raw_enabled` reads as `false`, same as "off").
+    // active, and would otherwise clobber a request the user made while an
+    // earlier session's outcome was still sitting in `Live::raw_enabled`.
     raw_requested: bool,
     // Written by the spawned `supervise` task on a terminal error, read and
     // republished by `tick()` as the `error` property. A separate lock from
@@ -313,12 +311,12 @@ impl qobject::CrownBridge {
         };
         let active = snap.connection.is_active();
         let ready = snap.device_name.is_some();
-        // While a session is active, `raw` publishes what the transport
-        // actually did (`Snapshot::raw_enabled`) rather than the user's
-        // request: a failed subscribe or the deviceInfo-timeout degrade
-        // path (see `ble.rs`) then reads as "Raw: off" instead of a button
-        // that keeps claiming success next to a blank waveform. Before a
-        // session starts (or after one ends), this instead republishes
+        // While a session is active, `raw` publishes `Snapshot::raw_enabled`
+        // — the value `supervise` decided for this session and wrote once,
+        // at the top; it never changes again for the life of the session,
+        // so toggling the control (which QML disables while active anyway)
+        // couldn't take effect even if it ran. Before a session starts (or
+        // after one ends), this instead republishes
         // `raw_requested` — never the outcome an *earlier* session may have
         // just written into this same property, which `start()` correctly
         // never reads but a human looking at the button still would.
@@ -534,12 +532,12 @@ impl qobject::CrownBridge {
 
     /// Flips the raw-stream choice for the *next* session.
     ///
-    /// `supervise` takes `raw_enabled` by value and reads it once, at spawn
-    /// time, to fix the BLE subscription set for the life of that session;
-    /// it is never re-read. So this has no effect on a session already
-    /// running — QML disables the control while connected so that's never a
-    /// surprise, rather than something a user discovers by watching a flat
-    /// trace.
+    /// `supervise` takes `raw_enabled` by value and reads it once, before
+    /// the reconnect loop starts, to decide whether the OSC listener runs
+    /// for the life of that session; it is never re-read. So this has no
+    /// effect on a session already running — QML disables the control while
+    /// connected so that's never a surprise, rather than something a user
+    /// discovers by watching a flat trace.
     pub fn toggle_raw(mut self: Pin<&mut Self>) {
         // QML only allows this while idle (`enabled: !crown.active`), so
         // `raw`'s displayed value is already the pending choice here, not

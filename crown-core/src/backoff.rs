@@ -135,7 +135,7 @@ pub async fn supervise(
     live: Arc<Mutex<Live>>,
     creds: Credentials,
     store: Arc<dyn TokenStore>,
-    _raw_enabled: bool,
+    raw_enabled: bool,
     recorder: Arc<Mutex<Option<Recorder>>>,
 ) -> anyhow::Result<()> {
     let adapter = match crate::ble::first_adapter().await {
@@ -147,6 +147,47 @@ pub async fn supervise(
             return Err(e);
         }
     };
+
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    // Independent of the BLE reconnect loop on purpose: OSC is a separate
+    // transport over a separate network, so a Bluetooth reconnect must not
+    // interrupt the raw stream, and a WiFi hiccup must not disturb metrics.
+    // Aborted (not just dropped) when `_osc` goes out of scope at the end of
+    // this function, since a plain `JoinHandle` leaks the task -- and the
+    // UDP port it holds -- across sessions otherwise.
+    let _osc = raw_enabled.then(|| {
+        let live = live.clone();
+        let device_id = creds.device_id.clone();
+        let recorder = recorder.clone();
+        AbortOnDrop(tokio::spawn(async move {
+            if let Err(e) = crate::osc::listen(
+                live,
+                device_id,
+                crate::filter::FilterConfig::default(),
+                recorder,
+            )
+            .await
+            {
+                eprintln!("warning: OSC listener stopped: {e}");
+            }
+        }))
+    });
+
+    // Set once, here, rather than on every BLE reconnect: this is what the
+    // front ends read as `Snapshot::raw_enabled` for the life of the
+    // session, and the OSC listener above is spawned (or not) from the same
+    // value, so the two can never disagree.
+    {
+        let mut l = crate::sync::lock(&live);
+        l.raw_enabled = raw_enabled;
+        l.touch();
+    }
 
     let mut attempt = 0u32;
     loop {
