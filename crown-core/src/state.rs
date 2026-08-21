@@ -98,6 +98,30 @@ pub struct Live {
     rev: u64,
 }
 
+/// Relabels a positional signal-quality map onto the device's channel names.
+///
+/// The firmware keys `signalQuality` by position ("0".."7"), not by the names
+/// `deviceInfo` carries, so every name lookup misses and the whole electrode
+/// display goes grey. Relabelling here, rather than at ingest, is what makes
+/// it safe: the two characteristics arrive independently and can race, and
+/// only a snapshot has both in hand at once.
+///
+/// A key that is not an index, or points past the channel list, passes
+/// through untouched — firmware that starts sending real names keeps working.
+fn label_quality(quality: &SignalQuality, names: &[String]) -> SignalQuality {
+    quality
+        .iter()
+        .map(|(key, q)| {
+            let name = key
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| names.get(i))
+                .unwrap_or(key);
+            (name.clone(), *q)
+        })
+        .collect()
+}
+
 impl Live {
     pub fn new() -> Self {
         Self {
@@ -214,15 +238,16 @@ impl Live {
     /// metric loop and the OSC listener take on every notification, so a
     /// slow render here is itself a contributor to notification lag.
     pub fn snapshot(&self, width_px: usize) -> Snapshot {
+        let channel_names = self
+            .device
+            .as_ref()
+            .map(|d| d.channel_names.clone())
+            .unwrap_or_default();
         Snapshot {
             connection: self.connection,
             device_name: self.device.as_ref().map(|d| d.device_nickname.clone()),
-            channel_names: self
-                .device
-                .as_ref()
-                .map(|d| d.channel_names.clone())
-                .unwrap_or_default(),
-            quality: self.quality.clone(),
+            quality: label_quality(&self.quality, &channel_names),
+            channel_names,
             bands: self.bands.clone(),
             calm: self.calm,
             focus: self.focus,
@@ -251,7 +276,59 @@ impl Default for Live {
 mod tests {
     use super::*;
     use crate::raw::RawSample;
-    use crate::streams::DeviceInfo;
+    use crate::streams::{ChannelQuality, DeviceInfo, QualityStatus};
+
+    #[test]
+    fn positional_quality_keys_are_relabelled_onto_the_channel_names() {
+        // Real firmware keys this map "0".."7"; a name lookup against it
+        // misses every entry and the whole electrode display goes grey.
+        let mut live = Live::new();
+        live.configure(info(2));
+        live.quality = [
+            ("0".to_string(), quality(QualityStatus::Great)),
+            ("1".to_string(), quality(QualityStatus::NoContact)),
+        ]
+        .into_iter()
+        .collect();
+
+        let snap = live.snapshot(10);
+        assert_eq!(snap.quality["CH0"].status, QualityStatus::Great);
+        assert_eq!(snap.quality["CH1"].status, QualityStatus::NoContact);
+    }
+
+    #[test]
+    fn quality_keys_that_are_not_positions_pass_through_untouched() {
+        // Firmware that starts sending real names, and an index past the end
+        // of the channel list, both have to survive rather than vanish.
+        let mut live = Live::new();
+        live.configure(info(2));
+        live.quality = [
+            ("CP3".to_string(), quality(QualityStatus::Good)),
+            ("7".to_string(), quality(QualityStatus::Bad)),
+        ]
+        .into_iter()
+        .collect();
+
+        let snap = live.snapshot(10);
+        assert_eq!(snap.quality["CP3"].status, QualityStatus::Good);
+        assert_eq!(snap.quality["7"].status, QualityStatus::Bad);
+    }
+
+    #[test]
+    fn quality_relabelling_is_a_no_op_before_device_info_arrives() {
+        let mut live = Live::new();
+        live.quality = [("0".to_string(), quality(QualityStatus::Great))]
+            .into_iter()
+            .collect();
+        assert_eq!(live.snapshot(10).quality["0"].status, QualityStatus::Great);
+    }
+
+    fn quality(status: QualityStatus) -> ChannelQuality {
+        ChannelQuality {
+            standard_deviation: 1.0,
+            status,
+        }
+    }
 
     fn info(channels: usize) -> DeviceInfo {
         DeviceInfo {

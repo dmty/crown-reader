@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import QtQuick.Layouts
 
 ColumnLayout {
@@ -13,9 +14,9 @@ ColumnLayout {
             model: ["calm", "focus"]
             ColumnLayout {
                 required property string modelData
-                Text { text: modelData; font.pixelSize: 12; opacity: 0.6 }
+                Label { text: modelData; font.pixelSize: 12; opacity: 0.7 }
                 Rectangle {
-                    width: 120; height: 14; radius: 7; color: "#22000000"
+                    width: 120; height: 14; radius: 7; color: "#40808080"
                     Rectangle {
                         height: parent.height; radius: 7
                         color: modelData === "calm" ? "#4a90d9" : "#d98a4a"
@@ -32,8 +33,8 @@ ColumnLayout {
             model: ["delta", "theta", "alpha", "beta", "gamma"]
             ColumnLayout {
                 required property string modelData
-                Text { text: modelData; font.pixelSize: 12; opacity: 0.6 }
-                Text {
+                Label { text: modelData; font.pixelSize: 12; opacity: 0.7 }
+                Label {
                     text: {
                         root.bridge.rev; // re-read on every tick bump; band() is an invokable, not a bound property
                         return root.bridge.band(modelData).toFixed(3);
@@ -70,7 +71,7 @@ ColumnLayout {
                     if (q === "NoContact") return "#c04a4a";
                     return "#999999";
                 }
-                Text {
+                Label {
                     anchors.centerIn: parent
                     text: modelData
                     color: "white"
@@ -80,10 +81,10 @@ ColumnLayout {
         }
     }
 
-    Text {
+    Label {
         text: "dropped: " + root.bridge.dropped
         font.pixelSize: 10
-        opacity: 0.4
+        opacity: 0.6
     }
 
     // The numbers above are only as current as the stream feeding them. When

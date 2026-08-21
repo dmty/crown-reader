@@ -45,7 +45,9 @@ pub struct ChannelQuality {
     pub status: QualityStatus,
 }
 
-/// Keyed by channel name, not indexed by position.
+/// Keyed by whatever string the device uses per channel. Real firmware sends
+/// positions ("0".."7"); `Live::snapshot` relabels those onto
+/// `DeviceInfo::channel_names`, which is the only place both are in hand.
 pub type SignalQuality = BTreeMap<String, ChannelQuality>;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -80,7 +82,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_signal_quality_keyed_by_channel_name() {
+    fn parses_signal_quality_entries() {
         let json = r#"{"CP3":{"standardDeviation":8.1,"status":"great"},
                        "C3":{"standardDeviation":90.0,"status":"noContact"}}"#;
         let q: SignalQuality = serde_json::from_str(json).unwrap();

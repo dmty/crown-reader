@@ -39,7 +39,7 @@ ApplicationWindow {
             y: 16
             spacing: 12
 
-            Text { text: "Status: " + crown.connection; font.pixelSize: 20 }
+            Label { text: "Status: " + crown.connection; font.pixelSize: 20 }
 
             // `crown.error` only ever carries a session-ending failure
             // (`supervise` returns on a terminal error, never a transient
@@ -149,10 +149,10 @@ ApplicationWindow {
                 font.pixelSize: 11
             }
 
-            Text {
+            Label {
                 text: crown.recording === "" ? "" : "Recording to " + crown.recording
                 font.pixelSize: 11
-                opacity: 0.7
+                opacity: 0.8
             }
         }
     }
