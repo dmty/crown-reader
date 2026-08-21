@@ -70,6 +70,35 @@ pub fn decode_raw(packet_bytes: &[u8], device_id: &str) -> Option<OscSample> {
     })
 }
 
+/// Turns the wrapping message counter into a count of missing samples.
+#[derive(Debug, Default)]
+pub struct LossTracker {
+    previous: Option<i32>,
+}
+
+impl LossTracker {
+    /// Returns how many samples went missing between the previous message
+    /// and this one.
+    pub fn observe(&mut self, counter: i32) -> u64 {
+        let missing = match self.previous {
+            None => 0,
+            Some(previous) => {
+                let step = (counter - previous).rem_euclid(COUNTER_MODULUS);
+                // A step of 0 is a duplicate, not 32 consecutive drops:
+                // losing exactly one full cycle is far less likely than the
+                // device or the network repeating one.
+                if step <= 1 {
+                    0
+                } else {
+                    (step - 1) as u64
+                }
+            }
+        };
+        self.previous = Some(counter);
+        missing
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +228,50 @@ mod tests {
         }))
         .unwrap();
         assert!(decode_raw(&bytes, DEVICE).is_none());
+    }
+
+    #[test]
+    fn consecutive_counters_report_no_loss() {
+        let mut tracker = LossTracker::default();
+        assert_eq!(tracker.observe(0), 0);
+        assert_eq!(tracker.observe(1), 0);
+        assert_eq!(tracker.observe(2), 0);
+    }
+
+    #[test]
+    fn the_counter_wrapping_at_thirty_two_is_not_a_loss() {
+        let mut tracker = LossTracker::default();
+        tracker.observe(30);
+        assert_eq!(tracker.observe(31), 0);
+        assert_eq!(tracker.observe(0), 0, "wrap must not read as 31 lost samples");
+        assert_eq!(tracker.observe(1), 0);
+    }
+
+    #[test]
+    fn a_gap_reports_the_number_of_missing_samples() {
+        let mut tracker = LossTracker::default();
+        tracker.observe(5);
+        assert_eq!(tracker.observe(8), 2, "6 and 7 went missing");
+    }
+
+    #[test]
+    fn a_gap_across_the_wrap_boundary_is_counted_correctly() {
+        let mut tracker = LossTracker::default();
+        tracker.observe(30);
+        assert_eq!(tracker.observe(1), 2, "31 and 0 went missing");
+    }
+
+    #[test]
+    fn the_first_sample_of_a_session_reports_no_loss() {
+        assert_eq!(LossTracker::default().observe(17), 0);
+    }
+
+    #[test]
+    fn a_repeated_counter_reports_no_loss_rather_than_a_full_wrap() {
+        // A duplicate is far likelier than exactly 32 consecutive drops, and
+        // reporting 31 losses for one would badly skew the figure.
+        let mut tracker = LossTracker::default();
+        tracker.observe(4);
+        assert_eq!(tracker.observe(4), 0);
     }
 }
