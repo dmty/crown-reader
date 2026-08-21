@@ -51,22 +51,18 @@ pub fn decode_raw(packet_bytes: &[u8], device_id: &str) -> Option<OscSample> {
         })
         .collect::<Option<_>>()?;
 
-    let timestamp = match tail.first()? {
-        // Milliseconds, as a decimal string: "1787270434786.832".
-        OscType::String(s) => s.parse::<f64>().ok()?,
-        _ => return None,
+    // Milliseconds, as a decimal string: "1787270434786.832".
+    let [OscType::String(ts), OscType::Int(counter), ..] = tail else {
+        return None;
     };
+    let timestamp = ts.parse::<f64>().ok()?;
     if !timestamp.is_finite() || timestamp < 0.0 {
         return None;
     }
-    let counter = match tail.get(1)? {
-        OscType::Int(i) => *i,
-        _ => return None,
-    };
 
     Some(OscSample {
         sample: RawSample { timestamp: timestamp as u64, marker: 0, data },
-        counter,
+        counter: *counter,
     })
 }
 
