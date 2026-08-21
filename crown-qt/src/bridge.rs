@@ -516,13 +516,12 @@ impl qobject::CrownBridge {
                 // (already-installed) recorder slot back to `None`, and
                 // call `clear_recording_indicator` — which this line would
                 // then overwrite with `Some(dir)` right afterward. That
-                // indicator would never self-correct, since
-                // `record_raw_samples`/`record_derived_line` only act on a
-                // `Some` slot, and the slot would be `None` from then on.
-                // With `Live::recording` set first, the transport can only
-                // ever observe "recording, no recorder yet" (which it
-                // silently no-ops on) — never "recorder failed, indicator
-                // stuck on".
+                // indicator would never self-correct, since every recorder
+                // write path only ever touches a `Some` slot, and the slot
+                // would be `None` from then on. With `Live::recording` set
+                // first, the transport can only ever observe "recording, no
+                // recorder yet" (which it silently no-ops on) — never
+                // "recorder failed, indicator stuck on".
                 let mut live = crown_core::sync::lock(&self.live);
                 live.recording = Some(dir);
                 live.touch();

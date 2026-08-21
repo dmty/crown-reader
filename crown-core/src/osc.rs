@@ -139,9 +139,9 @@ impl ListenerState {
         // unhandled that failure is silent forever -- `write_raw` returns
         // before touching the writer, so `Drop`'s flush reports nothing --
         // while `Live::recording` keeps claiming a live path. Latch the
-        // recorder off on the first failure, mirroring
-        // `ble::record_raw_samples`, and only take `live`'s lock once the
-        // recorder's own lock has been released.
+        // recorder off on the first failure, and only take `live`'s lock
+        // once the recorder's own lock has been released -- never hold both
+        // at once.
         let recorder_failed = {
             let mut guard = crate::sync::lock(recorder);
             match guard.as_mut() {

@@ -45,13 +45,14 @@ pub fn dump_gatt(p: &Peripheral) {
 /// consumes plus the eleven it does not — the vendor SDK names all seventeen,
 /// and `dump_gatt` prints them so an unrecognised UUID stands out as new
 /// firmware rather than as an unknown.
-const CHAR_NAMES: [(Uuid, &str); 16] = [
+const CHAR_NAMES: [(Uuid, &str); 17] = [
     (CHAR_AUTH, "auth"),
     (CHAR_DEVICE_INFO, "deviceInfo"),
     (CHAR_POWER_BY_BAND, "powerByBand"),
     (CHAR_FOCUS, "focus"),
     (CHAR_CALM, "calm"),
     (CHAR_SIGNAL_QUALITY, "signalQuality"),
+    (Uuid::from_u128(0x009cf0bb_b68d_4af1_a0e5_625f2eb964a6), "raw"),
     (Uuid::from_u128(0xd7e84cb2_ff37_4afc_9ed8_5577aeb84542), "deviceId"),
     (Uuid::from_u128(0xd2e4b9e7_ab9d_4806_88a3_58584c1cf02b), "action"),
     (Uuid::from_u128(0x1defa07f_2d1c_4e55_b981_eedabba7ae2b), "status"),
