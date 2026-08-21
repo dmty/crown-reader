@@ -54,6 +54,11 @@ async fn main() {
             snap.dropped_frames,
             snap.dropped_frames - last_dropped,
         );
+        // Only when it matters: a healthy stream sits at zero, and a line
+        // that always prints "stale=0ms" trains the eye to skip it.
+        if let Some(ms) = snap.metric_staleness_ms.filter(|ms| *ms > 2_000) {
+            println!("  WARNING: metrics are {:.0}s behind", ms as f64 / 1000.0);
+        }
         for (name, q) in &snap.quality {
             print!("  {name}:{:?}", q.status);
         }

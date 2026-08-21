@@ -20,6 +20,13 @@ pub mod qobject {
         #[qproperty(f64, calm)]
         #[qproperty(f64, focus)]
         #[qproperty(i32, dropped)]
+        /// Milliseconds the metric stream has fallen behind, or -1 before
+        /// the first metric arrives. Negative rather than optional because
+        /// QML has no ergonomic Option; the QML side treats <0 as "unknown".
+        ///
+        /// One word deliberately: cxx-qt 0.9 does not convert case, so a
+        /// snake_case field would have to be spelled the same way in QML.
+        #[qproperty(i32, staleness)]
         #[qproperty(QString, recording)]
         #[qproperty(bool, raw)]
         // `ConnectionState::is_active()`, republished so QML can gate the
@@ -105,6 +112,7 @@ pub struct CrownBridgeRust {
     calm: f64,
     focus: f64,
     dropped: i32,
+    staleness: i32,
     recording: QString,
     // Display only: what the raw button should currently read. Outcome
     // (`Snapshot::raw_enabled`) while a session is active, `raw_requested`
@@ -153,6 +161,7 @@ impl Default for CrownBridgeRust {
             calm: 0.0,
             focus: 0.0,
             dropped: 0,
+            staleness: -1,
             recording: QString::from(""),
             raw: false,
             active: false,
@@ -285,6 +294,14 @@ impl qobject::CrownBridge {
         let calm = snap.calm as f64;
         let focus = snap.focus as f64;
         let dropped = snap.dropped_frames as i32;
+        // Saturating: a session left running long enough to exceed i32
+        // milliseconds (~24 days) should pin the display at "very stale"
+        // rather than wrap into a small or negative number that reads as
+        // healthy.
+        let staleness = snap
+            .metric_staleness_ms
+            .map(|ms| ms.clamp(0, i32::MAX as i64) as i32)
+            .unwrap_or(-1);
         // Derived from `Snapshot.recording`, like every other displayed
         // value, rather than cached separately: `Live::recording` is the
         // one place recording start/stop and the transport's clear-on-
@@ -313,6 +330,7 @@ impl qobject::CrownBridge {
         self.as_mut().set_calm(calm);
         self.as_mut().set_focus(focus);
         self.as_mut().set_dropped(dropped);
+        self.as_mut().set_staleness(staleness);
         self.as_mut().set_recording(recording);
         self.as_mut().set_active(active);
         self.as_mut().set_ready(ready);

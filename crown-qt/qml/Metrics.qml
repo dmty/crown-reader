@@ -85,4 +85,17 @@ ColumnLayout {
         font.pixelSize: 10
         opacity: 0.4
     }
+
+    // The numbers above are only as current as the stream feeding them. When
+    // raw is enabled the link cannot carry both, and calm/focus fall tens of
+    // seconds behind while still rendering as though live -- so say so on
+    // screen rather than leaving a stale score looking healthy.
+    Text {
+        readonly property int staleMs: root.bridge.staleness
+        visible: staleMs > 2000
+        text: "metrics " + (staleMs / 1000).toFixed(0) + "s behind"
+        color: staleMs > 10000 ? "#d95a4a" : "#d98a4a"
+        font.pixelSize: 11
+        font.bold: true
+    }
 }

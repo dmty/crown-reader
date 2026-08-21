@@ -14,6 +14,7 @@ use super::{
     CHAR_AUTH, CHAR_CALM, CHAR_DEVICE_INFO, CHAR_FOCUS, CHAR_POWER_BY_BAND, CHAR_RAW,
     CHAR_SIGNAL_QUALITY,
 };
+use super::host_epoch_ms;
 use crate::raw::RawSample;
 
 /// Prints every service and characteristic the device exposes, with its
@@ -70,12 +71,6 @@ const CHAR_NAMES: [(Uuid, &str); 17] = [
 
 fn char_name(uuid: Uuid) -> &'static str {
     CHAR_NAMES.iter().find(|(u, _)| *u == uuid).map(|(_, n)| *n).unwrap_or("UNKNOWN")
-}
-
-/// Host clock in epoch milliseconds, matching how `record.rs` stamps its
-/// clock anchor — the probes compare device timestamps against this.
-fn host_epoch_ms() -> i64 {
-    chrono::Local::now().timestamp_millis()
 }
 
 /// Whether the transport probes should report.

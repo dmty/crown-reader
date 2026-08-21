@@ -57,6 +57,15 @@ pub struct Snapshot {
     pub raw_enabled: bool,
     pub dropped_frames: u64,
     pub raw_samples: u64,
+    /// How far behind the metric stream has fallen, in milliseconds, or
+    /// `None` before the first metric arrives.
+    ///
+    /// Measured against the smallest device-to-host offset seen this
+    /// session rather than against the host clock directly, so a constant
+    /// difference between the two clocks reads as 0 rather than as
+    /// permanent staleness. A healthy stream sits near zero; a stream the
+    /// link can no longer carry climbs without bound.
+    pub metric_staleness_ms: Option<i64>,
     pub recording: Option<PathBuf>,
     pub rev: u64,
 }
@@ -72,6 +81,12 @@ pub struct Live {
     pub dropped_frames: u64,
     pub raw_samples: u64,
     pub recording: Option<PathBuf>,
+    /// Smallest `host - device` offset seen this session, and the current
+    /// staleness measured from it. Kept separate from the clock itself:
+    /// callers pass both timestamps in, so this stays deterministic and
+    /// testable rather than reading the wall clock here.
+    metric_offset_floor: Option<i64>,
+    metric_staleness_ms: Option<i64>,
     /// When the current run last transitioned into `Streaming`, if it has.
     /// Set by `ble::run` on that transition and cleared back to `None` when
     /// a fresh run starts scanning, so a caller measuring how long a session
@@ -96,6 +111,8 @@ impl Live {
             dropped_frames: 0,
             raw_samples: 0,
             recording: None,
+            metric_offset_floor: None,
+            metric_staleness_ms: None,
             streaming_since: None,
             rings: Vec::new(),
             rev: 0,
@@ -147,6 +164,22 @@ impl Live {
         self.touch();
     }
 
+    /// Records that a metric carrying `device_ms` arrived when the host
+    /// clock read `host_ms`.
+    ///
+    /// Does not `touch()`: every caller already does so for the value the
+    /// metric carried, and a second bump would only cost pollers a redundant
+    /// snapshot.
+    pub fn note_metric_time(&mut self, device_ms: f64, host_ms: i64) {
+        if !device_ms.is_finite() {
+            return;
+        }
+        let offset = host_ms - device_ms as i64;
+        let floor = self.metric_offset_floor.get_or_insert(offset);
+        *floor = (*floor).min(offset);
+        self.metric_staleness_ms = Some(offset - *floor);
+    }
+
     /// Call after any mutation so pollers can skip unchanged state.
     pub fn touch(&mut self) {
         self.rev += 1;
@@ -180,6 +213,7 @@ impl Live {
             raw_enabled: self.raw_enabled,
             dropped_frames: self.dropped_frames,
             raw_samples: self.raw_samples,
+            metric_staleness_ms: self.metric_staleness_ms,
             recording: self.recording.clone(),
             rev: self.rev,
         }
@@ -322,6 +356,45 @@ mod tests {
         let before = live.snapshot(10).rev;
         live.push_raw(&RawSample { timestamp: 1, marker: 0, data: vec![1.0, 2.0] });
         assert!(live.snapshot(10).rev > before);
+    }
+
+    #[test]
+    fn metric_staleness_is_zero_when_the_stream_keeps_up_despite_clock_skew() {
+        let mut live = Live::new();
+        // Device clock runs 5s ahead of the host. That is skew, not lag, and
+        // must not be reported as staleness.
+        live.note_metric_time(105_000.0, 100_000);
+        live.note_metric_time(106_000.0, 101_000);
+        live.note_metric_time(107_000.0, 102_000);
+        assert_eq!(live.snapshot(10).metric_staleness_ms, Some(0));
+    }
+
+    #[test]
+    fn metric_staleness_grows_when_the_stream_falls_behind() {
+        let mut live = Live::new();
+        live.note_metric_time(100_000.0, 100_000);
+        assert_eq!(live.snapshot(10).metric_staleness_ms, Some(0));
+
+        // Host advances 10s; the newest metric is only 2s newer, so 8s of
+        // backlog has accumulated.
+        live.note_metric_time(102_000.0, 110_000);
+        assert_eq!(live.snapshot(10).metric_staleness_ms, Some(8_000));
+    }
+
+    #[test]
+    fn metric_staleness_is_none_until_a_metric_arrives() {
+        assert_eq!(Live::new().snapshot(10).metric_staleness_ms, None);
+    }
+
+    #[test]
+    fn a_non_finite_metric_timestamp_is_ignored_rather_than_poisoning_the_floor() {
+        let mut live = Live::new();
+        live.note_metric_time(100_000.0, 100_000);
+        live.note_metric_time(f64::NAN, 101_000);
+        live.note_metric_time(f64::INFINITY, 102_000);
+        // Still measuring from the one good offset, not from a garbage floor.
+        live.note_metric_time(101_000.0, 101_000);
+        assert_eq!(live.snapshot(10).metric_staleness_ms, Some(0));
     }
 
     #[test]

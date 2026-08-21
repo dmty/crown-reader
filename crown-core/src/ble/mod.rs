@@ -28,6 +28,13 @@ const NAME_PREFIXES: [&str; 2] = ["Crown-", "Notion-"];
 
 mod probe;
 
+/// Host clock in epoch milliseconds, matching how `record.rs` stamps its
+/// clock anchor. Paired with a metric's own device timestamp to measure how
+/// far the metric stream has fallen behind.
+fn host_epoch_ms() -> i64 {
+    chrono::Local::now().timestamp_millis()
+}
+
 use probe::{dump_gatt, MetricProbe, RawProbe};
 
 /// btleplug's CoreBluetooth backend resolves a characteristic read's
@@ -749,6 +756,9 @@ async fn stream_session(
 
         for line in stitchers.entry(n.uuid).or_default().push(&n.value) {
             let mut calm_timestamp = None;
+            // Read before the lock: a clock read is cheap, but nothing that
+            // does not need the guard belongs under it.
+            let host_ms = host_epoch_ms();
             let parsed = {
                 let mut l = crate::sync::lock(&live);
                 let parsed = match n.uuid {
@@ -759,11 +769,13 @@ async fn stream_session(
                     }),
                     CHAR_CALM => apply_json(&line, |a: Awareness| {
                         l.calm = a.probability as f32;
+                        l.note_metric_time(a.timestamp, host_ms);
                         l.touch();
                         calm_timestamp = Some(a.timestamp);
                     }),
                     CHAR_FOCUS => apply_json(&line, |a: Awareness| {
                         l.focus = a.probability as f32;
+                        l.note_metric_time(a.timestamp, host_ms);
                         l.touch();
                     }),
                     CHAR_SIGNAL_QUALITY => apply_json(&line, |q: SignalQuality| {
