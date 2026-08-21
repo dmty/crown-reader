@@ -82,6 +82,14 @@ async fn main() {
             // A slowly climbing `dropped` is that same ~2% loss and expected;
             // a fast climb instead points at a decode or channel-count fault
             // — or a real network stall, which climbs exactly the same way.
+            // `raw_enabled` starts false and is only set once `supervise` is
+            // past adapter setup (backoff.rs), so gate on the session being
+            // active too — otherwise this fires during that startup window,
+            // and on an adapter failure, and blames UDP 9000 for either.
+            if snap.connection.is_active() && !snap.raw_enabled {
+                println!("  raw listener is not running — check for another process already holding UDP 9000");
+            }
+
             let raw_rate = snap.raw_samples - last_raw_samples;
             last_raw_samples = snap.raw_samples;
             let extent = snap.waveform.first().and_then(|cols| {
