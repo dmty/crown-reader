@@ -68,19 +68,19 @@ async fn main() {
         last_dropped = snap.dropped_frames;
 
         if raw_enabled {
-            // `raw` is the accepted-sample rate: compare it to the device's
-            // reported sampling rate directly — a healthy Crown reads ~256/s,
-            // and a stalled stream reads 0 even while calm/focus keep moving.
+            // `raw` is the accepted-sample rate over OSC: a healthy stream
+            // reads ~250/s against the device's 256 Hz, the shortfall being
+            // the ~2% UDP loss measured on this link. A steady 0 means the
+            // device is not broadcasting — check that OSC is enabled in its
+            // settings and that it shares this subnet.
             //
             // A healthy ch0 extent stays bounded and roughly stable tick to
             // tick; a misaligned decode makes it jump by orders of magnitude
             // between ticks. It's a min/max over a rolling 10s ring, so it's a
             // screen, not a verdict — one blink latches it high for 10s.
             //
-            // A climbing `dropped` has three possible causes: a channel-count/
-            // sample-size mismatch (the likely signature of misaligned raw
-            // decoding), a non-finite sample value, or configure() rejecting a
-            // bad deviceInfo report.
+            // A slowly climbing `dropped` is that same ~2% loss and expected;
+            // a fast climb instead points at a decode or channel-count fault.
             let raw_rate = snap.raw_samples - last_raw_samples;
             last_raw_samples = snap.raw_samples;
             let extent = snap.waveform.first().and_then(|cols| {
