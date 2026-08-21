@@ -7,9 +7,14 @@
 //! it — including packets from someone else's headset. Every message is
 //! matched against our own device id before it is trusted.
 
+use std::sync::{Arc, Mutex};
+
 use rosc::{OscPacket, OscType};
 
+use crate::filter::{ChannelFilter, FilterConfig};
 use crate::raw::RawSample;
+use crate::record::Recorder;
+use crate::state::Live;
 
 /// The device broadcasts here and offers no way to configure a destination.
 pub const OSC_PORT: u16 = 9000;
@@ -94,6 +99,106 @@ impl LossTracker {
             0
         } else {
             (step - 1) as u64
+        }
+    }
+}
+
+/// Per-session state for the listener: one filter per channel, plus the
+/// loss tracker.
+struct ListenerState {
+    device_id: String,
+    config: FilterConfig,
+    filters: Vec<ChannelFilter>,
+    loss: LossTracker,
+}
+
+impl ListenerState {
+    fn new(device_id: String, config: FilterConfig) -> Self {
+        Self { device_id, config, filters: Vec::new(), loss: LossTracker::default() }
+    }
+
+    /// Decodes one datagram and applies it. Anything unrecognised is
+    /// ignored in silence — a broadcast port carries other people's traffic,
+    /// and treating that as an error would make `dropped_frames` meaningless.
+    fn handle(
+        &mut self,
+        datagram: &[u8],
+        live: &Arc<Mutex<Live>>,
+        recorder: &Arc<Mutex<Option<Recorder>>>,
+    ) {
+        let Some(decoded) = decode_raw(datagram, &self.device_id) else {
+            return;
+        };
+        let missing = self.loss.observe(decoded.counter);
+
+        // The recorder takes the signal verbatim, before filtering, so
+        // `raw.csv` stays the ground truth `meta.json` advertises it to be.
+        // Filtering is a display concern and a display concern only -- and
+        // for the same reason, samples reconstructed by `fill_gap` below
+        // must never reach it: a capture claiming to be verbatim cannot
+        // contain values the device never sent.
+        if let Some(recorder) = crate::sync::lock(recorder).as_mut() {
+            let _ = recorder.write_raw(&decoded.sample);
+        }
+
+        if self.filters.len() != decoded.sample.data.len() {
+            self.filters =
+                (0..decoded.sample.data.len()).map(|_| ChannelFilter::new(&self.config)).collect();
+        }
+
+        // Every sample UDP dropped must still be fed to the filters, or the
+        // gap becomes a phase discontinuity that rings the notch's poles --
+        // measured, a stream with gaps simply closed up leaves *more* mains
+        // hum than applying no filter at all, because at one drop per ~50
+        // samples the ringing never decays between drops. `fill_gap`
+        // reconstructs the missing sample from the two before it, which is
+        // near-exact here precisely because what is missing is hum.
+        //
+        // Bounded by construction: `LossTracker` reports at most
+        // `COUNTER_MODULUS - 2` missing samples, so this cannot spin.
+        for _ in 0..missing {
+            for filter in self.filters.iter_mut() {
+                filter.fill_gap();
+            }
+        }
+
+        let filtered: Vec<f64> = decoded
+            .sample
+            .data
+            .iter()
+            .zip(self.filters.iter_mut())
+            .map(|(v, f)| f.apply(*v))
+            .collect();
+
+        let mut l = crate::sync::lock(live);
+        l.dropped_frames += missing;
+        l.push_raw(&RawSample { data: filtered, ..decoded.sample });
+    }
+}
+
+/// Receives raw EEG until the task is cancelled.
+///
+/// Binds the broadcast port the device sends to. Returns an error only if
+/// the socket cannot be bound — a receive error is logged and the loop
+/// continues, since one bad datagram must not end a session.
+pub async fn listen(
+    live: Arc<Mutex<Live>>,
+    device_id: String,
+    config: FilterConfig,
+    recorder: Arc<Mutex<Option<Recorder>>>,
+) -> anyhow::Result<()> {
+    let socket = tokio::net::UdpSocket::bind(("0.0.0.0", OSC_PORT)).await?;
+    let mut state = ListenerState::new(device_id, config);
+    // rosc decodes OSC bundles recursively with no depth bound, so a large
+    // nested-bundle datagram recurses in proportion to its size. The real
+    // `/raw` message is 132 bytes; 2048 leaves wide margin while keeping
+    // that recursion bounded. Anything bigger just fails to decode, which is
+    // fine since only `/raw` is ever accepted.
+    let mut buffer = vec![0u8; 2048];
+    loop {
+        match socket.recv_from(&mut buffer).await {
+            Ok((len, _)) => state.handle(&buffer[..len], &live, &recorder),
+            Err(e) => eprintln!("warning: OSC receive failed: {e}"),
         }
     }
 }
@@ -293,5 +398,52 @@ mod tests {
         let mut tracker = LossTracker::default();
         tracker.observe(4);
         assert_eq!(tracker.observe(4), 0);
+    }
+
+    #[test]
+    fn handling_a_datagram_filters_records_and_counts_loss() {
+        use crate::filter::FilterConfig;
+        use crate::state::Live;
+        use crate::streams::DeviceInfo;
+        use std::sync::{Arc, Mutex};
+
+        let live = Arc::new(Mutex::new(Live::new()));
+        crate::sync::lock(&live).configure(DeviceInfo {
+            device_id: DEVICE.into(),
+            device_nickname: "Crown-83C".into(),
+            channel_names: (0..8).map(|i| format!("ch{i}")).collect(),
+            channels: 8,
+            sampling_rate: 256.0,
+        });
+
+        let mut state = ListenerState::new(DEVICE.into(), FilterConfig::default());
+        let recorder = Arc::new(Mutex::new(None));
+
+        let first = raw_packet(DEVICE, [100.0; 8], "1787270434786.832", 0);
+        state.handle(&first, &live, &recorder);
+        assert_eq!(crate::sync::lock(&live).snapshot(10).raw_samples, 1);
+
+        // Counter jumps 0 -> 3: samples 1 and 2 were dropped in flight.
+        let second = raw_packet(DEVICE, [100.0; 8], "1787270434790.569", 3);
+        state.handle(&second, &live, &recorder);
+        let snap = crate::sync::lock(&live).snapshot(10);
+        assert_eq!(snap.raw_samples, 2);
+        assert_eq!(snap.dropped_frames, 2, "the two missing samples must be counted");
+    }
+
+    #[test]
+    fn a_foreign_datagram_changes_nothing() {
+        use crate::filter::FilterConfig;
+        use crate::state::Live;
+        use std::sync::{Arc, Mutex};
+
+        let live = Arc::new(Mutex::new(Live::new()));
+        let mut state = ListenerState::new(DEVICE.into(), FilterConfig::default());
+        let recorder = Arc::new(Mutex::new(None));
+
+        state.handle(b"not osc at all", &live, &recorder);
+        let snap = crate::sync::lock(&live).snapshot(10);
+        assert_eq!(snap.raw_samples, 0);
+        assert_eq!(snap.dropped_frames, 0, "noise on the port is not a dropped sample");
     }
 }
