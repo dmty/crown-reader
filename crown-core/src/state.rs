@@ -180,6 +180,18 @@ impl Live {
         self.metric_staleness_ms = Some(offset - *floor);
     }
 
+    /// Forgets the device-to-host clock relationship learned this session.
+    ///
+    /// `Live` outlives a single connection — the reconnect supervisor reuses
+    /// it — so without this the floor stays at the previous session's
+    /// minimum. A device whose clock resynced across the reconnect would
+    /// then read as permanently stale, or silently re-floor and hide real
+    /// staleness, depending on which way it moved.
+    pub fn forget_metric_clock(&mut self) {
+        self.metric_offset_floor = None;
+        self.metric_staleness_ms = None;
+    }
+
     /// Call after any mutation so pollers can skip unchanged state.
     pub fn touch(&mut self) {
         self.rev += 1;
@@ -379,6 +391,24 @@ mod tests {
         // backlog has accumulated.
         live.note_metric_time(102_000.0, 110_000);
         assert_eq!(live.snapshot(10).metric_staleness_ms, Some(8_000));
+    }
+
+    #[test]
+    fn a_reconnect_forgets_the_previous_session_clock_offset() {
+        let mut live = Live::new();
+        live.note_metric_time(100_000.0, 100_000);
+        live.note_metric_time(102_000.0, 110_000);
+        assert_eq!(live.snapshot(10).metric_staleness_ms, Some(8_000));
+
+        // A fresh session: the device clock may have resynced, so the old
+        // floor is meaningless and must not carry over.
+        live.forget_metric_clock();
+        assert_eq!(live.snapshot(10).metric_staleness_ms, None);
+
+        // A device now running 30s behind the host is a new baseline, not
+        // 30s of staleness inherited from the last session.
+        live.note_metric_time(70_000.0, 100_000);
+        assert_eq!(live.snapshot(10).metric_staleness_ms, Some(0));
     }
 
     #[test]

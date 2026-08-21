@@ -498,6 +498,7 @@ async fn try_run(
             ConnectionState::Scanning => {
                 l.streaming_since = None;
                 l.raw_enabled = false;
+                l.forget_metric_clock();
             }
             ConnectionState::Streaming => l.streaming_since = Some(Instant::now()),
             _ => {}
