@@ -120,12 +120,7 @@ impl ListenerState {
     /// Decodes one datagram and applies it. Anything unrecognised is
     /// ignored in silence — a broadcast port carries other people's traffic,
     /// and treating that as an error would make `dropped_frames` meaningless.
-    fn handle(
-        &mut self,
-        datagram: &[u8],
-        live: &Arc<Mutex<Live>>,
-        recorder: &Arc<Mutex<Option<Recorder>>>,
-    ) {
+    fn handle(&mut self, datagram: &[u8], live: &Mutex<Live>, recorder: &Mutex<Option<Recorder>>) {
         let Some(decoded) = decode_raw(datagram, &self.device_id) else {
             return;
         };
@@ -402,10 +397,7 @@ mod tests {
 
     #[test]
     fn handling_a_datagram_filters_records_and_counts_loss() {
-        use crate::filter::FilterConfig;
-        use crate::state::Live;
         use crate::streams::DeviceInfo;
-        use std::sync::{Arc, Mutex};
 
         let live = Arc::new(Mutex::new(Live::new()));
         crate::sync::lock(&live).configure(DeviceInfo {
@@ -433,10 +425,6 @@ mod tests {
 
     #[test]
     fn a_foreign_datagram_changes_nothing() {
-        use crate::filter::FilterConfig;
-        use crate::state::Live;
-        use std::sync::{Arc, Mutex};
-
         let live = Arc::new(Mutex::new(Live::new()));
         let mut state = ListenerState::new(DEVICE.into(), FilterConfig::default());
         let recorder = Arc::new(Mutex::new(None));
