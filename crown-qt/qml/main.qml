@@ -129,16 +129,15 @@ ApplicationWindow {
                 }
             }
 
-            // "Raw: on" now means "listening on UDP", which says nothing
-            // about whether the device is actually broadcasting — without
-            // this, an unconfigured device looks identical to a broken one.
+            // "Raw: on" now means "listening on UDP" — an unconfigured
+            // device looks identical to a broken one without this.
             Text {
                 visible: {
                     // waveform() is an invokable, not a bound property; read
-                    // rev first so this re-evaluates when data arrives (see
-                    // Waveform.qml for the same pattern). `ready` gates out
-                    // the window before configure() has sized the rings, so
-                    // a slow deviceInfo doesn't read as a missing device.
+                    // rev first so this re-evaluates when data arrives.
+                    // `ready` gates out the window before configure() has
+                    // sized the rings, so a slow deviceInfo doesn't read as
+                    // a missing device.
                     crown.rev;
                     return crown.raw && crown.active && crown.ready
                         && crown.waveform(0, 100).length === 0;
