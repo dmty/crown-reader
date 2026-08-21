@@ -312,10 +312,12 @@ impl qobject::CrownBridge {
         let active = snap.connection.is_active();
         let ready = snap.device_name.is_some();
         // While a session is active, `raw` publishes `Snapshot::raw_enabled`
-        // — the value `supervise` decided for this session and wrote once,
-        // at the top; it never changes again for the life of the session,
-        // so toggling the control (which QML disables while active anyway)
-        // couldn't take effect even if it ran. Before a session starts (or
+        // — `true` for the life of the session unless the OSC listener's
+        // bind failed, in which case it flips to `false` once. It means the
+        // listener is running, not that samples are arriving: a device
+        // that's powered on but not broadcasting still reads `true`.
+        // Toggling the control (which QML disables while active anyway)
+        // couldn't take effect either way. Before a session starts (or
         // after one ends), this instead republishes
         // `raw_requested` — never the outcome an *earlier* session may have
         // just written into this same property, which `start()` correctly

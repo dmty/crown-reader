@@ -155,6 +155,17 @@ pub async fn supervise(
         }
     }
 
+    // Set once, here, rather than on every BLE reconnect: this is what the
+    // front ends read as `Snapshot::raw_enabled` for the life of the
+    // session. Written before the listener below is spawned -- not after --
+    // so its bind-failure arm, which flips this back to `false`, is always
+    // the last writer rather than racing this line on another worker.
+    {
+        let mut l = crate::sync::lock(&live);
+        l.raw_enabled = raw_enabled;
+        l.touch();
+    }
+
     // Independent of the BLE reconnect loop on purpose: OSC is a separate
     // transport over a separate network, so a Bluetooth reconnect must not
     // interrupt the raw stream, and a WiFi hiccup must not disturb metrics.
@@ -166,6 +177,12 @@ pub async fn supervise(
         let device_id = creds.device_id.clone();
         let recorder = recorder.clone();
         AbortOnDrop(tokio::spawn(async move {
+            let live_on_err = live.clone();
+            // `listen` only ever returns `Err` from its opening `bind` --
+            // the receive loop itself runs until cancelled -- so this is
+            // "never started", not "stopped", and the front ends need to
+            // know: without this, a bind failure leaves `raw_enabled`
+            // claiming success next to a permanently flat trace.
             if let Err(e) = crate::osc::listen(
                 live,
                 device_id,
@@ -174,20 +191,13 @@ pub async fn supervise(
             )
             .await
             {
-                eprintln!("warning: OSC listener stopped: {e}");
+                eprintln!("warning: OSC listener failed to start: {e}");
+                let mut l = crate::sync::lock(&live_on_err);
+                l.raw_enabled = false;
+                l.touch();
             }
         }))
     });
-
-    // Set once, here, rather than on every BLE reconnect: this is what the
-    // front ends read as `Snapshot::raw_enabled` for the life of the
-    // session, and the OSC listener above is spawned (or not) from the same
-    // value, so the two can never disagree.
-    {
-        let mut l = crate::sync::lock(&live);
-        l.raw_enabled = raw_enabled;
-        l.touch();
-    }
 
     let mut attempt = 0u32;
     loop {
