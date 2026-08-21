@@ -9,7 +9,6 @@ use futures::StreamExt;
 use uuid::Uuid;
 
 use crate::auth::{token, Credentials, TokenStore};
-use crate::raw::{RawDecoder, RawSample};
 use crate::record::Recorder;
 use crate::state::{ConnectionState, Live};
 use crate::stitch::Stitcher;
@@ -18,7 +17,6 @@ use crate::streams::{Awareness, DeviceInfo, PowerByBand, SignalQuality};
 pub const SERVICE_UUID: Uuid = Uuid::from_u128(0x00001803_0000_1000_8000_00805f9b34fb);
 pub const CHAR_AUTH: Uuid = Uuid::from_u128(0x7f9f1a35_9816_471b_bf67_2ec6f2295a1d);
 pub const CHAR_DEVICE_INFO: Uuid = Uuid::from_u128(0x97b81f68_04cf_4650_a044_14924f11b9ee);
-pub const CHAR_RAW: Uuid = Uuid::from_u128(0x009cf0bb_b68d_4af1_a0e5_625f2eb964a6);
 pub const CHAR_POWER_BY_BAND: Uuid = Uuid::from_u128(0x2f6236dd_215a_427f_b94c_ab5df71937af);
 pub const CHAR_FOCUS: Uuid = Uuid::from_u128(0x8e12baf1_81bb_4a1b_8948_9e68a4457d2a);
 pub const CHAR_CALM: Uuid = Uuid::from_u128(0x7d47617d_a60a_41d1_8df6_cfb78d02ffeb);
@@ -35,7 +33,7 @@ fn host_epoch_ms() -> i64 {
     chrono::Local::now().timestamp_millis()
 }
 
-use probe::{dump_gatt, MetricProbe, RawProbe};
+use probe::{dump_gatt, MetricProbe};
 
 /// btleplug's CoreBluetooth backend resolves a characteristic read's
 /// underlying future only from a `didUpdateValueForCharacteristic` callback
@@ -50,9 +48,9 @@ use probe::{dump_gatt, MetricProbe, RawProbe};
 const AUTH_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound on the wait for the one-shot deviceInfo notification after
 /// subscribing to it. Longer than `AUTH_READ_TIMEOUT`: firing this early on
-/// a device that's simply slow to start notifying turns a working headset
-/// into a silently raw-less session, which is a worse failure mode than
-/// waiting a few extra seconds.
+/// a device that's simply slow to start notifying degrades a working
+/// headset to `channels=0`, which is a worse failure mode than waiting a
+/// few extra seconds.
 const DEVICE_INFO_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Bound on `Peripheral::disconnect()`, called on every exit from
@@ -207,55 +205,24 @@ fn apply_json<T: serde::de::DeserializeOwned>(line: &str, apply: impl FnOnce(T))
     }
 }
 
-/// Writes decoded raw samples to the active recorder, if any. Returns
-/// `true` if this call was the one that just turned recording off, so the
-/// caller can clear `Live::recording` to match — deliberately not done in
-/// here: locking `live` while still holding `recorder`'s guard would invert
-/// the lock order `run`'s doc comment establishes. The caller locks
-/// `recorder` (via this function), lets the guard drop, and only then
-/// locks `live`.
+/// Records a successfully-parsed derived-metric line to the active
+/// recorder, if any. Returns `true` if this call was the one that just
+/// turned recording off, so the caller can clear `Live::recording` to
+/// match — deliberately not done in here: locking `live` while still
+/// holding `recorder`'s guard would invert the lock order `run`'s doc
+/// comment establishes. The caller locks `recorder` (via this function),
+/// lets the guard drop, and only then locks `live`. Only `calm`, `focus`,
+/// `powerByBand`, and `signalQuality` are derived streams; `deviceInfo`
+/// (and anything else routed through this dispatch) is metadata already
+/// captured once in `meta.json`, and is not written again here.
 ///
 /// Called only after the caller's `live` lock has already been released —
 /// see `run`'s doc comment for the lock-ordering rule this keeps. A write
-/// failure — a disk problem, or `Recorder::write_raw` rejecting a
-/// width-mismatched sample — is not a streaming problem: recording is
+/// failure — a disk problem — is not a streaming problem: recording is
 /// secondary to the live connection, so it must not propagate into
-/// `stream_session`'s `Result` and tear the session down. It also must not
-/// free-run `eprintln!` at the raw sample rate: neither failure heals
-/// itself sample-to-sample, and at up to ~256 samples/sec a per-sample
-/// warning would itself become a source of loop stalls — the exact hazard
-/// this module's own comments call out as a contributor to raw desync. So
-/// the first failure is reported once and stops the recording (`recorder`
-/// set to `None`) rather than retried.
-fn record_raw_samples(recorder: &Mutex<Option<Recorder>>, samples: &[RawSample]) -> bool {
-    if samples.is_empty() {
-        return false;
-    }
-    let mut guard = crate::sync::lock(recorder);
-    let Some(r) = guard.as_mut() else { return false };
-    for s in samples {
-        if let Err(e) = r.write_raw(s) {
-            eprintln!("warning: recorder stopped, failed to write raw sample: {e}");
-            *guard = None;
-            return true;
-        }
-    }
-    false
-}
-
-/// Records a successfully-parsed derived-metric line to the active
-/// recorder, if any. Returns `true` on the same "recording just stopped"
-/// condition as `record_raw_samples`, for the same reason. Only `calm`,
-/// `focus`, `powerByBand`, and `signalQuality` are derived streams;
-/// `deviceInfo` (and anything else routed through this dispatch) is
-/// metadata already captured once in `meta.json`, and is not written again
-/// here.
-///
-/// Called only after the caller's `live` lock has already been released —
-/// same ordering rule as `record_raw_samples`. Latches off on the first
-/// write failure for the same reason: a disk failure persists, so retrying
-/// every line would eventually add up to the same kind of noisy, self-
-/// inflicted stall `record_raw_samples` avoids, just on a slower clock.
+/// `stream_session`'s `Result` and tear the session down. Latches off on
+/// the first write failure rather than retried: a disk failure persists, so
+/// retrying every line would only add noise.
 fn record_derived_line(recorder: &Mutex<Option<Recorder>>, uuid: Uuid, line: &str) -> bool {
     let name = match uuid {
         CHAR_CALM => "calm",
@@ -277,9 +244,9 @@ fn record_derived_line(recorder: &Mutex<Option<Recorder>>, uuid: Uuid, line: &st
 
 /// Clears `Live::recording` after a recorder write failure has already
 /// turned the recorder itself off. Called with `recorder`'s lock already
-/// released (both call sites above only return `true` after dropping their
-/// guard), so this is the only place in the raw/derived recording path
-/// that locks `live` — never nested inside a `recorder` lock.
+/// released (`record_derived_line` only returns `true` after dropping its
+/// guard), so this is the only place in the derived recording path that
+/// locks `live` — never nested inside a `recorder` lock.
 fn clear_recording_indicator(live: &Mutex<Live>) {
     let mut l = crate::sync::lock(live);
     l.recording = None;
@@ -455,11 +422,10 @@ pub async fn run(
     live: Arc<Mutex<Live>>,
     creds: Credentials,
     store: Arc<dyn TokenStore>,
-    raw_enabled: bool,
     recorder: Arc<Mutex<Option<Recorder>>>,
 ) -> Result<()> {
     let live_for_failure = live.clone();
-    let result = try_run(adapter, live, creds, store, raw_enabled, recorder).await;
+    let result = try_run(adapter, live, creds, store, recorder).await;
     if result.is_err() {
         let mut l = crate::sync::lock(&live_for_failure);
         l.connection = ConnectionState::Failed;
@@ -473,31 +439,25 @@ async fn try_run(
     live: Arc<Mutex<Live>>,
     creds: Credentials,
     store: Arc<dyn TokenStore>,
-    raw_enabled: bool,
     recorder: Arc<Mutex<Option<Recorder>>>,
 ) -> Result<()> {
-    // `streaming_since` and `raw_enabled` are managed here, alongside
-    // `connection`, rather than by the caller: `Scanning` marks the start of
-    // a fresh attempt and clears state left over from a previous run on this
-    // same `Live` (it is not recreated per attempt) — `streaming_since` back
-    // to `None`, `raw_enabled` back to `false` — and the rest of this
-    // function only ever sets each back to something truthful for *this*
-    // attempt. Without the `raw_enabled` reset, a reconnect whose raw
-    // subscribe fails (or that never reaches the point where raw is
-    // attempted at all) would keep publishing the previous attempt's success
-    // instead of this attempt's failure. `Streaming` is the one transition
-    // that stamps `streaming_since`. Every other state (`Connecting`,
-    // `Authenticating`, `Disconnected`) leaves both alone — in particular,
-    // `Disconnected` must not clear `streaming_since`, since a caller reading
-    // `Live` after `run()` returns (to measure how long the session actually
-    // streamed) needs it to still be there.
+    // `streaming_since` is managed here, alongside `connection`, rather than
+    // by the caller: `Scanning` marks the start of a fresh attempt and
+    // clears state left over from a previous run on this same `Live` (it is
+    // not recreated per attempt) back to `None`, and the rest of this
+    // function only ever sets it back to something truthful for *this*
+    // attempt. `Streaming` is the one transition that stamps
+    // `streaming_since`. Every other state (`Connecting`, `Authenticating`,
+    // `Disconnected`) leaves it alone — in particular, `Disconnected` must
+    // not clear `streaming_since`, since a caller reading `Live` after
+    // `run()` returns (to measure how long the session actually streamed)
+    // needs it to still be there.
     let set = |s: ConnectionState| {
         let mut l = crate::sync::lock(&live);
         l.connection = s;
         match s {
             ConnectionState::Scanning => {
                 l.streaming_since = None;
-                l.raw_enabled = false;
                 l.forget_metric_clock();
             }
             ConnectionState::Streaming => l.streaming_since = Some(Instant::now()),
@@ -522,8 +482,7 @@ async fn try_run(
     // caller needs that result to classify the failure and decide whether
     // to retry.
     let result =
-        stream_session(&peripheral, live.clone(), creds, store, raw_enabled, recorder, &set)
-            .await;
+        stream_session(&peripheral, live.clone(), creds, store, recorder, &set).await;
     match tokio::time::timeout(DISCONNECT_TIMEOUT, peripheral.disconnect()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => eprintln!("warning: failed to disconnect from the headset: {e}"),
@@ -545,7 +504,6 @@ async fn stream_session(
     live: Arc<Mutex<Live>>,
     creds: Credentials,
     store: Arc<dyn TokenStore>,
-    raw_enabled: bool,
     recorder: Arc<Mutex<Option<Recorder>>>,
     // `Send + Sync` on the trait object, not just the underlying closure: a
     // bare `dyn Fn(ConnectionState)` erases that the closure only captures a
@@ -597,11 +555,10 @@ async fn stream_session(
     // a single one instead.
     liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // deviceInfo gates everything else: raw has no delimiter or checksum, so
-    // decoding it needs the channel count from deviceInfo first, and every
-    // per-channel structure in `Live` is sized from it too. It is resolved by
-    // subscribing to it alone and waiting, before any other characteristic
-    // is subscribed. That ordering matters: btleplug buffers at most 16
+    // deviceInfo gates everything else: every per-channel structure in
+    // `Live` is sized from its channel count. It is resolved by subscribing
+    // to it alone and waiting, before any other characteristic is
+    // subscribed. That ordering matters: btleplug buffers at most 16
     // notifications and silently discards the oldest past that (a lagged
     // notification is dropped, not surfaced), so subscribing the other four
     // characteristics first — any of which can emit before anything drains
@@ -632,7 +589,7 @@ async fn stream_session(
     let mut stitchers: std::collections::HashMap<Uuid, Stitcher> = Default::default();
 
     peripheral.subscribe(&device_info_char).await?;
-    let device_info_configured = match tokio::time::timeout(DEVICE_INFO_TIMEOUT, async {
+    match tokio::time::timeout(DEVICE_INFO_TIMEOUT, async {
         let mut configured = false;
         while !configured {
             let Some(n) =
@@ -661,23 +618,18 @@ async fn stream_session(
             set(ConnectionState::Disconnected);
             return Ok(());
         }
-        Ok(Some(())) => true,
+        Ok(Some(())) => {}
         Err(_) => {
             // No deviceInfo within DEVICE_INFO_TIMEOUT: degrade instead of
             // hanging. The other four characteristics still get subscribed
-            // below and the session still reaches Streaming — the same
-            // shape of session a device with no deviceInfo produced before
-            // this function ever tried to gate raw on it — just without a
-            // channel count to size anything from, so raw stays off
-            // regardless of `raw_enabled`. Counted here since there is no
-            // logging dependency in this workspace: a human watching the
-            // CLI sees `channels=0` (and, with `--raw`, `cols=0
-            // ch0_extent=[no data yet]`) hold forever instead of populating,
+            // below and the session still reaches Streaming — just without a
+            // channel count to size anything from. Counted here since there
+            // is no logging dependency in this workspace: a human watching
+            // the CLI sees `channels=0` hold forever instead of populating,
             // alongside this one-off bump in `dropped_frames`.
             let mut l = crate::sync::lock(&live);
             l.dropped_frames += 1;
             l.touch();
-            false
         }
     };
 
@@ -685,44 +637,8 @@ async fn stream_session(
         peripheral.subscribe(&characteristic(peripheral, uuid).await?).await?;
     }
 
-    // Raw is opportunistic: a device without the characteristic, or a
-    // subscribe that fails for any other reason, just leaves raw off rather
-    // than tearing down an otherwise healthy session. `Live::raw_enabled`
-    // is the actual outcome of that attempt, not a record of intent — the
-    // bridge's `tick()` republishes it as the `raw` property while a session
-    // is active precisely so a failed subscribe here is visible in the UI
-    // instead of hiding behind a button still showing the user's original
-    // request. Also skipped outright if deviceInfo never configured `Live`:
-    // there is no channel count to decode raw bytes against.
-    //
-    // Subscribed last, immediately before we start draining the stream: raw
-    // is the one characteristic where an evicted notification can't self-heal
-    // (see the comment below), so unlike the four JSON streams above, the gap
-    // between "notifications can arrive" and "something is reading them" has
-    // to be kept as close to zero as it can be.
-    if raw_enabled && device_info_configured {
-        let subscribed = match characteristic(peripheral, CHAR_RAW).await {
-            Ok(raw_char) => peripheral.subscribe(&raw_char).await.is_ok(),
-            Err(_) => false,
-        };
-        let mut l = crate::sync::lock(&live);
-        l.raw_enabled = subscribed;
-        l.touch();
-    }
-
     set(ConnectionState::Streaming);
 
-    // A lost raw notification permanently offsets the byte stream: there is
-    // no delimiter or checksum to resynchronize on, and btleplug drops a
-    // lagged notification rather than surfacing it, so this layer has no way
-    // to detect or recover from one. Contrast a lost JSON line, which
-    // self-heals at the next `\n`. A resulting desync shows up as absurd
-    // values in the CLI's alignment diagnostic — currently the only place
-    // it's visible. Also worth remembering: the `Live` mutex locked all
-    // through this loop is contended with the UI/CLI thread's `snapshot()`
-    // call, so a slow render is itself a contributor to notification lag.
-    let mut raw_decoder = RawDecoder::default();
-    let mut raw_probe = RawProbe::new();
     let mut metric_probe = MetricProbe::new();
 
     loop {
@@ -730,30 +646,6 @@ async fn stream_session(
         else {
             break;
         };
-
-        if n.uuid == CHAR_RAW {
-            let channels = {
-                let l = crate::sync::lock(&live);
-                l.device.as_ref().map(|d| d.channels).unwrap_or(0)
-            };
-            if channels == 0 {
-                // Belt-and-braces: raw is only ever subscribed once deviceInfo
-                // has configured `Live`, so this should be unreachable.
-                continue;
-            }
-            let samples = raw_decoder.push(&n.value, channels);
-            raw_probe.observe(&samples);
-            {
-                let mut l = crate::sync::lock(&live);
-                for s in &samples {
-                    l.push_raw(s);
-                }
-            } // `live`'s lock is dropped here, before `recorder` is ever touched.
-            if record_raw_samples(&recorder, &samples) {
-                clear_recording_indicator(&live);
-            }
-            continue;
-        }
 
         for line in stitchers.entry(n.uuid).or_default().push(&n.value) {
             let mut calm_timestamp = None;

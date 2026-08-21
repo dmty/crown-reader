@@ -2,30 +2,26 @@
 //!
 //! Separated from the session logic because they share nothing with it: the
 //! call sites are one line each, the state is private, and deleting this
-//! module would leave `super` intact.
-
-use std::time::Instant;
+//! module would leave `super` intact. Bluetooth delivered raw at 24% of
+//! realtime with unbounded-growing latency, and while subscribed pushed the
+//! metric streams from 1-233 ms of lag to 25-49 seconds.
 
 use btleplug::api::Peripheral as _;
 use btleplug::platform::Peripheral;
 use uuid::Uuid;
 
 use super::{
-    CHAR_AUTH, CHAR_CALM, CHAR_DEVICE_INFO, CHAR_FOCUS, CHAR_POWER_BY_BAND, CHAR_RAW,
+    CHAR_AUTH, CHAR_CALM, CHAR_DEVICE_INFO, CHAR_FOCUS, CHAR_POWER_BY_BAND,
     CHAR_SIGNAL_QUALITY,
 };
 use super::host_epoch_ms;
-use crate::raw::RawSample;
 
 /// Prints every service and characteristic the device exposes, with its
-/// properties, when `CROWN_GATT_DUMP` is set. Marks the seven UUIDs this
+/// properties, when `CROWN_GATT_DUMP` is set. Marks the six UUIDs this
 /// crate knows so anything unrecognised stands out.
 ///
-/// The seven were taken from a fragment of the vendor SDK; the device has
-/// never been asked directly what else it offers. A lower-rate or
-/// lower-channel-count variant of the raw stream would show up here, and
-/// would matter a great deal — the full raw stream needs four times the
-/// bandwidth this link delivers.
+/// The six were taken from a fragment of the vendor SDK; the device has
+/// never been asked directly what else it offers.
 pub fn dump_gatt(p: &Peripheral) {
     if std::env::var_os("CROWN_GATT_DUMP").is_none() {
         return;
@@ -45,14 +41,13 @@ pub fn dump_gatt(p: &Peripheral) {
     }
 }
 
-/// Every characteristic the device exposes, named. The seven this crate
-/// consumes plus the ten it does not — the vendor SDK names all seventeen,
+/// Every characteristic the device exposes, named. The six this crate
+/// consumes plus the eleven it does not — the vendor SDK names all seventeen,
 /// and `dump_gatt` prints them so an unrecognised UUID stands out as new
 /// firmware rather than as an unknown.
-const CHAR_NAMES: [(Uuid, &str); 17] = [
+const CHAR_NAMES: [(Uuid, &str); 16] = [
     (CHAR_AUTH, "auth"),
     (CHAR_DEVICE_INFO, "deviceInfo"),
-    (CHAR_RAW, "raw"),
     (CHAR_POWER_BY_BAND, "powerByBand"),
     (CHAR_FOCUS, "focus"),
     (CHAR_CALM, "calm"),
@@ -106,80 +101,6 @@ impl MetricProbe {
             return;
         }
         eprintln!("metric probe: calm lag={:.0}ms", host_epoch_ms() as f64 - timestamp_ms);
-    }
-}
-
-/// Health of the raw stream, reported every `PROBE_WINDOW` samples when
-/// `CROWN_RAW_DEBUG` is set.
-///
-/// Two numbers, both of which the per-second sample rate alone cannot give:
-///
-/// - `device/wall` — 1.0 means the stream keeps pace with real time. Below
-///   that the device produces faster than the link delivers and a backlog is
-///   building.
-/// - `lag` — how far the newest sample sits behind the host clock. Lag that
-///   grows is an unbounded backlog; lag that holds steady is a fixed clock
-///   offset between device and host, which is harmless.
-pub struct RawProbe {
-    enabled: bool,
-    prev: Option<u64>,
-    count: usize,
-    window_start: Instant,
-    window_first_timestamp: Option<u64>,
-}
-
-/// Samples per report: roughly nine seconds at the rate the link delivers.
-const PROBE_WINDOW: usize = 600;
-
-impl RawProbe {
-    pub fn new() -> Self {
-        Self {
-            enabled: raw_debug(),
-            prev: None,
-            count: 0,
-            window_start: Instant::now(),
-            window_first_timestamp: None,
-        }
-    }
-
-    pub fn observe(&mut self, samples: &[RawSample]) {
-        if !self.enabled {
-            return;
-        }
-        for s in samples {
-            if self.window_first_timestamp.is_none() {
-                self.window_first_timestamp = Some(s.timestamp);
-            }
-            self.prev = Some(s.timestamp);
-            self.count += 1;
-        }
-        if self.count >= PROBE_WINDOW {
-            self.report();
-            self.reset();
-        }
-    }
-
-    fn report(&self) {
-        let wall = self.window_start.elapsed().as_secs_f64().max(0.001);
-        let device = match (self.window_first_timestamp, self.prev) {
-            (Some(first), Some(last)) => last.saturating_sub(first) as f64 / 1000.0,
-            _ => 0.0,
-        };
-        let lag = self.prev.map(|last| host_epoch_ms() - last as i64);
-        eprintln!(
-            "raw probe: {} samples, {device:.1}s device / {wall:.1}s wall = {:.2}x realtime, lag={}",
-            self.count,
-            device / wall,
-            lag.map(|l| format!("{l}ms")).unwrap_or_else(|| "n/a".into()),
-        );
-    }
-
-    fn reset(&mut self) {
-        self.count = 0;
-        self.window_start = Instant::now();
-        // Keeps `prev`: the gap between windows is a real interval, and
-        // dropping it would hide a stall at the seam.
-        self.window_first_timestamp = self.prev;
     }
 }
 

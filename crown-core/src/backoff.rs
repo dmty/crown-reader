@@ -135,7 +135,7 @@ pub async fn supervise(
     live: Arc<Mutex<Live>>,
     creds: Credentials,
     store: Arc<dyn TokenStore>,
-    raw_enabled: bool,
+    _raw_enabled: bool,
     recorder: Arc<Mutex<Option<Recorder>>>,
 ) -> anyhow::Result<()> {
     let adapter = match crate::ble::first_adapter().await {
@@ -162,7 +162,6 @@ pub async fn supervise(
             live.clone(),
             creds_clone,
             store.clone(),
-            raw_enabled,
             recorder.clone(),
         )
         .await;
