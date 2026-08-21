@@ -74,6 +74,17 @@ impl ChannelFilter {
     pub fn predict_next(&self) -> f64 {
         self.notch.two_cos_w0 * self.notch.x1 - self.notch.x2
     }
+
+    /// Advances the filter by one sample the transport dropped, returning
+    /// what that sample's output would have been.
+    ///
+    /// Deliberately not `apply(predict_next())`: the prediction is already
+    /// a post-high-pass value, so routing it back through the high-pass
+    /// would filter it twice.
+    pub fn fill_gap(&mut self) -> f64 {
+        let predicted = self.predict_next();
+        self.notch.apply(predicted)
+    }
 }
 
 /// Direct-form-I biquad. Coefficients from the RBJ audio EQ cookbook.
@@ -166,7 +177,9 @@ mod tests {
         let mut filter = ChannelFilter::new(&config);
         let passed = response(&mut filter, 10.0, config.sample_rate_hz, 4.0);
         assert!(passed > 0.9, "10 Hz peak {passed} should stay above 0.9");
-        assert!(passed < 1.1, "10 Hz peak {passed} should not be amplified above unity");
+        // Correct normalization reads ~0.983 here; dropping the /a0 on the
+        // biquad coefficients reads ~1.02, so this bound is what pins it.
+        assert!(passed < 1.01, "10 Hz peak {passed} should not be amplified above unity");
     }
 
     #[test]
@@ -233,10 +246,8 @@ mod tests {
             let t = i as f64 / rate;
             let y = if i > 0 && i % 50 == 0 {
                 // Simulates a dropped packet: no raw sample arrives, so the
-                // prediction is fed straight to the notch in place of the
-                // high-passed value the missing sample would have produced.
-                let predicted = filter.predict_next();
-                filter.notch.apply(predicted)
+                // filter advances on its own prediction instead.
+                filter.fill_gap()
             } else {
                 filter.apply((2.0 * std::f64::consts::PI * config.mains_hz * t).sin())
             };
@@ -247,6 +258,40 @@ mod tests {
         assert!(
             peak < clean_peak + 0.05,
             "predicted-gap peak {peak} should stay close to the no-loss peak {clean_peak}"
+        );
+    }
+
+    #[test]
+    fn fill_gap_on_a_fresh_filter_is_zero_not_nan() {
+        let mut filter = ChannelFilter::new(&FilterConfig::default());
+        assert_eq!(filter.fill_gap(), 0.0);
+    }
+
+    #[test]
+    fn fill_gap_reconstructs_close_to_the_sample_it_replaces() {
+        let config = FilterConfig::default();
+        let rate = config.sample_rate_hz;
+        let hz = config.mains_hz;
+
+        // Two filters run in lockstep long enough to settle, then diverge:
+        // one sees the real next sample, the other only its prediction.
+        let mut real = ChannelFilter::new(&config);
+        let mut predicted = ChannelFilter::new(&config);
+        for i in 0..200 {
+            let t = i as f64 / rate;
+            let x = (2.0 * std::f64::consts::PI * hz * t).sin();
+            real.apply(x);
+            predicted.apply(x);
+        }
+
+        let t = 200.0 / rate;
+        let x = (2.0 * std::f64::consts::PI * hz * t).sin();
+        let real_next = real.apply(x);
+        let filled = predicted.fill_gap();
+
+        assert!(
+            (real_next - filled).abs() < 0.01,
+            "fill_gap {filled} should track the real sample {real_next} closely"
         );
     }
 }
