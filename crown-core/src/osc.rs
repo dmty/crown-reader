@@ -46,22 +46,26 @@ pub fn decode_raw(packet_bytes: &[u8], device_id: &str) -> Option<OscSample> {
         .iter()
         .map(|a| match a {
             OscType::Float(f) => Some(*f as f64),
-            OscType::Double(d) => Some(*d),
             _ => None,
         })
         .collect::<Option<_>>()?;
 
-    // Milliseconds, as a decimal string: "1787270434786.832".
+    // Milliseconds, as a decimal string: "1787270434786.832". Parsing the
+    // integer part as u64 directly is lossless, and it rejects NaN,
+    // infinity, negatives, and scientific notation by construction --
+    // none of those parse as u64, so there is nothing left to guard.
     let [OscType::String(ts), OscType::Int(counter), ..] = tail else {
         return None;
     };
-    let timestamp = ts.parse::<f64>().ok()?;
-    if !timestamp.is_finite() || timestamp < 0.0 {
-        return None;
-    }
+    let integer_part = match ts.split_once('.') {
+        Some((int, frac)) if frac.bytes().all(|b| b.is_ascii_digit()) => int,
+        Some(_) => return None,
+        None => ts.as_str(),
+    };
+    let timestamp = integer_part.parse::<u64>().ok()?;
 
     Some(OscSample {
-        sample: RawSample { timestamp: timestamp as u64, marker: 0, data },
+        sample: RawSample { timestamp, marker: 0, data },
         counter: *counter,
     })
 }
@@ -73,17 +77,21 @@ mod tests {
 
     const DEVICE: &str = "83ce6707229234b38aa695de3bf6d70e";
 
-    /// Builds a packet in the exact shape observed on the wire: eight
-    /// float32 channel values, a millisecond timestamp as a *string*, an
-    /// int32 counter, and a marker string.
-    fn raw_packet(device: &str, values: [f32; 8], timestamp: &str, counter: i32) -> Vec<u8> {
+    fn raw_args(values: [f32; 8], timestamp: &str, counter: i32) -> Vec<OscType> {
         let mut args: Vec<OscType> = values.iter().map(|v| OscType::Float(*v)).collect();
         args.push(OscType::String(timestamp.into()));
         args.push(OscType::Int(counter));
         args.push(OscType::String(String::new()));
+        args
+    }
+
+    /// Builds a packet in the exact shape observed on the wire: eight
+    /// float32 channel values, a millisecond timestamp as a *string*, an
+    /// int32 counter, and a marker string.
+    fn raw_packet(device: &str, values: [f32; 8], timestamp: &str, counter: i32) -> Vec<u8> {
         encoder::encode(&OscPacket::Message(OscMessage {
             addr: format!("/neurosity/notion/{device}/raw"),
-            args,
+            args: raw_args(values, timestamp, counter),
         }))
         .unwrap()
     }
@@ -137,5 +145,59 @@ mod tests {
     #[test]
     fn rejects_bytes_that_are_not_osc_at_all() {
         assert!(decode_raw(b"random udp noise", DEVICE).is_none());
+    }
+
+    #[test]
+    fn rejects_a_scientific_notation_timestamp_instead_of_saturating() {
+        // A float path parses this to 1e30 and saturates the cast to
+        // u64::MAX, which would poison any ordering built on the timestamp.
+        let bytes = raw_packet(DEVICE, [0.0; 8], "1e30", 1);
+        assert!(decode_raw(&bytes, DEVICE).is_none());
+    }
+
+    #[test]
+    fn rejects_a_negative_zero_timestamp() {
+        // A float path reads this as 0.0, passing an `>= 0.0` guard the
+        // integer parse never needs in the first place.
+        let bytes = raw_packet(DEVICE, [0.0; 8], "-0.0", 1);
+        assert!(decode_raw(&bytes, DEVICE).is_none());
+    }
+
+    #[test]
+    fn ignores_an_address_that_merely_embeds_our_device_id() {
+        // A `contains(device_id)` check would accept this. Exact-path
+        // matching is the only thing stopping an attacker-chosen prefix
+        // that happens to carry our device id.
+        let bytes = encoder::encode(&OscPacket::Message(OscMessage {
+            addr: format!("/attacker/{DEVICE}/raw"),
+            args: raw_args([0.0; 8], "1787270434786.832", 1),
+        }))
+        .unwrap();
+        assert!(decode_raw(&bytes, DEVICE).is_none());
+    }
+
+    #[test]
+    fn rejects_a_timestamp_with_a_garbled_fractional_part() {
+        // The fractional part is discarded, but garbage there is still a
+        // sign the sender isn't speaking the observed wire format.
+        let bytes = raw_packet(DEVICE, [0.0; 8], "1787270434786.not-a-number", 1);
+        assert!(decode_raw(&bytes, DEVICE).is_none());
+    }
+
+    #[test]
+    fn rejects_channel_values_that_are_not_float32() {
+        // Wire tags are always `,ffffffff...`; accepting Double widens the
+        // shape beyond anything hardware ever sends.
+        let mut args = vec![OscType::Double(1.0)];
+        args.extend((1..8).map(|_| OscType::Float(0.0)));
+        args.push(OscType::String("1787270434786.832".into()));
+        args.push(OscType::Int(1));
+        args.push(OscType::String(String::new()));
+        let bytes = encoder::encode(&OscPacket::Message(OscMessage {
+            addr: format!("/neurosity/notion/{DEVICE}/raw"),
+            args,
+        }))
+        .unwrap();
+        assert!(decode_raw(&bytes, DEVICE).is_none());
     }
 }
