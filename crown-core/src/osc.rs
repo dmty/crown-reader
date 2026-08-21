@@ -8,6 +8,7 @@
 //! matched against our own device id before it is trusted.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rosc::{OscPacket, OscType};
 
@@ -124,7 +125,6 @@ impl ListenerState {
         let Some(decoded) = decode_raw(datagram, &self.device_id) else {
             return;
         };
-        let missing = self.loss.observe(decoded.counter);
 
         // The recorder takes the signal verbatim, before filtering, so
         // `raw.csv` stays the ground truth `meta.json` advertises it to be.
@@ -132,14 +132,50 @@ impl ListenerState {
         // for the same reason, samples reconstructed by `fill_gap` below
         // must never reach it: a capture claiming to be verbatim cannot
         // contain values the device never sent.
-        if let Some(recorder) = crate::sync::lock(recorder).as_mut() {
-            let _ = recorder.write_raw(&decoded.sample);
+        //
+        // `write_raw` can fail on routine device behaviour, not just disk
+        // trouble: a mid-session `Live::configure` channel-count change
+        // leaves it rejecting every sample against the old header. Left
+        // unhandled that failure is silent forever -- `write_raw` returns
+        // before touching the writer, so `Drop`'s flush reports nothing --
+        // while `Live::recording` keeps claiming a live path. Latch the
+        // recorder off on the first failure, mirroring
+        // `ble::record_raw_samples`, and only take `live`'s lock once the
+        // recorder's own lock has been released.
+        let recorder_failed = {
+            let mut guard = crate::sync::lock(recorder);
+            match guard.as_mut() {
+                Some(r) => match r.write_raw(&decoded.sample) {
+                    Ok(()) => false,
+                    Err(e) => {
+                        eprintln!("warning: recorder stopped, failed to write raw sample: {e}");
+                        *guard = None;
+                        true
+                    }
+                },
+                None => false,
+            }
+        }; // recorder's lock is dropped here, before `live` is ever touched.
+        if recorder_failed {
+            let mut l = crate::sync::lock(live);
+            l.recording = None;
+            l.touch();
         }
 
         if self.filters.len() != decoded.sample.data.len() {
             self.filters =
                 (0..decoded.sample.data.len()).map(|_| ChannelFilter::new(&self.config)).collect();
+            // A channel-count change is a session discontinuity -- most
+            // plausibly a device restart -- and the wrapping counter starts
+            // over too. Without this reset, the first sample after one
+            // reads as up to `COUNTER_MODULUS - 2` samples lost against the
+            // previous session's counter: a spurious `dropped_frames` bump,
+            // plus that many bogus `fill_gap()` calls into these brand-new,
+            // zero-state filters.
+            self.loss = LossTracker::default();
         }
+
+        let missing = self.loss.observe(decoded.counter);
 
         // Every sample UDP dropped must still be fed to the filters, or the
         // gap becomes a phase discontinuity that rings the notch's poles --
@@ -193,7 +229,16 @@ pub async fn listen(
     loop {
         match socket.recv_from(&mut buffer).await {
             Ok((len, _)) => state.handle(&buffer[..len], &live, &recorder),
-            Err(e) => eprintln!("warning: OSC receive failed: {e}"),
+            Err(e) => {
+                eprintln!("warning: OSC receive failed: {e}");
+                // Tokio only clears readiness on `WouldBlock`; a persistent
+                // hard error (e.g. ENETDOWN) leaves the socket looking
+                // permanently ready, so `recv_from` would otherwise return
+                // this same error immediately forever -- pegging a worker
+                // thread and flooding stderr. A short sleep is enough to
+                // break that, and only runs on the error path.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
     }
 }
@@ -433,5 +478,172 @@ mod tests {
         let snap = crate::sync::lock(&live).snapshot(10);
         assert_eq!(snap.raw_samples, 0);
         assert_eq!(snap.dropped_frames, 0, "noise on the port is not a dropped sample");
+    }
+
+    fn configured_live() -> Arc<Mutex<Live>> {
+        use crate::streams::DeviceInfo;
+        let live = Arc::new(Mutex::new(Live::new()));
+        crate::sync::lock(&live).configure(DeviceInfo {
+            device_id: DEVICE.into(),
+            device_nickname: "Crown-83C".into(),
+            channel_names: (0..8).map(|i| format!("ch{i}")).collect(),
+            channels: 8,
+            sampling_rate: FilterConfig::default().sample_rate_hz,
+        });
+        live
+    }
+
+    /// Feeds `n` samples of a `hz` sine through `handle`, dropping every
+    /// 50th datagram in flight if `lossy` (the following datagram's counter
+    /// jumps by 2, exactly like a real UDP drop), and returns the peak
+    /// absolute filtered value pushed into `Live` over the final third —
+    /// by which point the filter has settled.
+    fn handled_peak(hz: f64, n: usize, lossy: bool) -> f32 {
+        let config = FilterConfig::default();
+        let rate = config.sample_rate_hz;
+        let live = configured_live();
+        let mut state = ListenerState::new(DEVICE.into(), config);
+        let recorder = Arc::new(Mutex::new(None));
+
+        for i in 0..n {
+            let t = i as f64 / rate;
+            let v = (2.0 * std::f64::consts::PI * hz * t).sin() as f32;
+            let dropped = lossy && i > 0 && i % 50 == 0;
+            if !dropped {
+                // The counter increments every iteration regardless of
+                // `dropped` -- it tracks the device's own per-sample clock,
+                // which keeps ticking whether or not the datagram arrives.
+                let bytes =
+                    raw_packet(DEVICE, [v; 8], "1787270434786.832", i as i32 % COUNTER_MODULUS);
+                state.handle(&bytes, &live, &recorder);
+            }
+        }
+
+        let waveform = crate::sync::lock(&live).snapshot(n).waveform[0].clone();
+        waveform[waveform.len() * 2 / 3..]
+            .iter()
+            .fold(0.0f32, |peak, &(lo, hi)| peak.max(lo.abs()).max(hi.abs()))
+    }
+
+    #[test]
+    fn gap_fill_keeps_dropped_mains_samples_from_ringing_the_notch() {
+        let config = FilterConfig::default();
+        let n = (config.sample_rate_hz * 4.0) as usize;
+
+        let clean_peak = handled_peak(config.mains_hz, n, false);
+        assert!(clean_peak < 0.1, "undropped mains peak {clean_peak} should be attenuated");
+
+        let lossy_peak = handled_peak(config.mains_hz, n, true);
+        assert!(
+            lossy_peak < clean_peak + 0.05,
+            "gap-filled peak {lossy_peak} should stay close to the no-loss peak {clean_peak}, \
+             not ring"
+        );
+    }
+
+    #[test]
+    fn handle_actually_filters_rather_than_passing_the_raw_value_through() {
+        let live = configured_live();
+        let mut state = ListenerState::new(DEVICE.into(), FilterConfig::default());
+        let recorder = Arc::new(Mutex::new(None));
+
+        for i in 0..2048 {
+            let bytes = raw_packet(DEVICE, [1000.0; 8], "1787270434786.832", i % COUNTER_MODULUS);
+            state.handle(&bytes, &live, &recorder);
+        }
+
+        let (_, last) = *crate::sync::lock(&live).snapshot(2048).waveform[0].last().unwrap();
+        assert!(last.abs() < 1.0, "a settled DC input should filter near zero, got {last}");
+    }
+
+    #[test]
+    fn the_recorder_receives_the_verbatim_signal_not_the_filtered_one() {
+        use crate::streams::DeviceInfo;
+
+        let root = std::env::temp_dir().join(format!(
+            "crown-test-{}-osc_recorder_receives_verbatim_signal",
+            std::process::id()
+        ));
+        let info = DeviceInfo {
+            device_id: DEVICE.into(),
+            device_nickname: "Crown-83C".into(),
+            channel_names: (0..8).map(|i| format!("ch{i}")).collect(),
+            channels: 8,
+            sampling_rate: FilterConfig::default().sample_rate_hz,
+        };
+        let rec = Recorder::start(&root, &info, "session-osc-verbatim").unwrap();
+        let recorder = Arc::new(Mutex::new(Some(rec)));
+
+        let live = Arc::new(Mutex::new(Live::new()));
+        crate::sync::lock(&live).configure(info);
+        let mut state = ListenerState::new(DEVICE.into(), FilterConfig::default());
+
+        // A large, obviously-unfiltered value: the notch would crush this to
+        // near zero by the time it reaches `Live` (see the test above), so
+        // finding it intact in raw.csv is what proves the recorder sees the
+        // signal before filtering, not after.
+        let first = raw_packet(DEVICE, [1000.0; 8], "1787270434786.832", 0);
+        state.handle(&first, &live, &recorder);
+        let second = raw_packet(DEVICE, [1000.0; 8], "1787270434790.832", 1);
+        state.handle(&second, &live, &recorder);
+
+        drop(crate::sync::lock(&recorder).take()); // flush by dropping the Recorder
+
+        let raw =
+            std::fs::read_to_string(root.join("session-osc-verbatim").join("raw.csv")).unwrap();
+        let rows: Vec<&str> = raw.lines().skip(1).collect();
+        assert_eq!(rows.len(), 2, "both samples should have been recorded");
+        for row in rows {
+            for v in row.split(',').skip(1) {
+                assert_eq!(
+                    v.parse::<f64>().unwrap(),
+                    1000.0,
+                    "raw.csv must hold the verbatim device value, not the filtered one"
+                );
+            }
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_recorder_write_failure_latches_recording_off() {
+        use crate::streams::DeviceInfo;
+
+        let root = std::env::temp_dir().join(format!(
+            "crown-test-{}-osc_recorder_write_failure_latches_off",
+            std::process::id()
+        ));
+        // Started with 4 channels; every real /raw datagram carries 8, so
+        // every write_raw call here is a guaranteed width mismatch --
+        // standing in for the mid-session Live::configure channel-count
+        // change this latch-off guards against.
+        let recorder_info = DeviceInfo {
+            device_id: DEVICE.into(),
+            device_nickname: "Crown-83C".into(),
+            channel_names: (0..4).map(|i| format!("ch{i}")).collect(),
+            channels: 4,
+            sampling_rate: FilterConfig::default().sample_rate_hz,
+        };
+        let rec = Recorder::start(&root, &recorder_info, "session-osc-write-fail").unwrap();
+        let recorder = Arc::new(Mutex::new(Some(rec)));
+
+        let live = configured_live();
+        crate::sync::lock(&live).recording = Some(root.join("session-osc-write-fail"));
+
+        let mut state = ListenerState::new(DEVICE.into(), FilterConfig::default());
+        let bytes = raw_packet(DEVICE, [1.0; 8], "1787270434786.832", 0);
+        state.handle(&bytes, &live, &recorder);
+
+        assert!(
+            crate::sync::lock(&recorder).is_none(),
+            "the recorder must latch off after a write failure"
+        );
+        assert!(
+            crate::sync::lock(&live).snapshot(10).recording.is_none(),
+            "the recording indicator must clear to match"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
