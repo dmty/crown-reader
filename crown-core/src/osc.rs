@@ -83,7 +83,10 @@ impl LossTracker {
         let Some(previous) = self.previous.replace(counter) else {
             return 0;
         };
-        let step = (counter - previous).rem_euclid(COUNTER_MODULUS);
+        // wrapping_sub: the counter comes off unauthenticated broadcast
+        // traffic, so it can be any i32. 32 divides 2^32, so wrapping the
+        // subtraction leaves the mod-32 residue exact.
+        let step = counter.wrapping_sub(previous).rem_euclid(COUNTER_MODULUS);
         // A step of 0 is a duplicate, not 32 consecutive drops: losing
         // exactly one full cycle is far less likely than the device or the
         // network repeating one.
@@ -248,6 +251,27 @@ mod tests {
         let mut tracker = LossTracker::default();
         tracker.observe(5);
         assert_eq!(tracker.observe(8), 2, "6 and 7 went missing");
+
+        // Pins the boundary against a `step <= 2` bug that would silently
+        // under-report every single-sample drop as zero.
+        let mut single_drop = LossTracker::default();
+        single_drop.observe(0);
+        assert_eq!(single_drop.observe(2), 1);
+
+        // Pins the modulus at 32: a smaller modulus would still pass the
+        // wrap-boundary tests but misjudge a gap that runs right up to them.
+        let mut near_wrap = LossTracker::default();
+        near_wrap.observe(0);
+        assert_eq!(near_wrap.observe(31), 30);
+    }
+
+    #[test]
+    fn a_hostile_counter_does_not_panic() {
+        // Unauthenticated broadcast traffic can carry any i32; the widest
+        // possible step must not overflow the subtraction.
+        let mut tracker = LossTracker::default();
+        tracker.observe(i32::MAX);
+        tracker.observe(i32::MIN);
     }
 
     #[test]
