@@ -80,22 +80,18 @@ impl LossTracker {
     /// Returns how many samples went missing between the previous message
     /// and this one.
     pub fn observe(&mut self, counter: i32) -> u64 {
-        let missing = match self.previous {
-            None => 0,
-            Some(previous) => {
-                let step = (counter - previous).rem_euclid(COUNTER_MODULUS);
-                // A step of 0 is a duplicate, not 32 consecutive drops:
-                // losing exactly one full cycle is far less likely than the
-                // device or the network repeating one.
-                if step <= 1 {
-                    0
-                } else {
-                    (step - 1) as u64
-                }
-            }
+        let Some(previous) = self.previous.replace(counter) else {
+            return 0;
         };
-        self.previous = Some(counter);
-        missing
+        let step = (counter - previous).rem_euclid(COUNTER_MODULUS);
+        // A step of 0 is a duplicate, not 32 consecutive drops: losing
+        // exactly one full cycle is far less likely than the device or the
+        // network repeating one.
+        if step <= 1 {
+            0
+        } else {
+            (step - 1) as u64
+        }
     }
 }
 
