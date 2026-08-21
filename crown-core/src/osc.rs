@@ -593,6 +593,12 @@ mod tests {
             std::fs::read_to_string(root.join("session-osc-verbatim").join("raw.csv")).unwrap();
         let rows: Vec<&str> = raw.lines().skip(1).collect();
         assert_eq!(rows.len(), 2, "both samples should have been recorded");
+        let timestamps: Vec<&str> = rows.iter().map(|r| r.split(',').next().unwrap()).collect();
+        assert_eq!(
+            timestamps,
+            ["1787270434786", "1787270434790"],
+            "rows must be recorded in the order the datagrams arrived"
+        );
         for row in rows {
             for v in row.split(',').skip(1) {
                 assert_eq!(
