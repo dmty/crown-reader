@@ -152,7 +152,13 @@ impl Live {
     }
 
     pub fn push_raw(&mut self, s: &RawSample) {
-        if s.data.len() != self.rings.len() || self.rings.is_empty() || s.data.iter().any(|v| !(*v as f32).is_finite()) {
+        if self.rings.is_empty() {
+            // Samples can arrive before configure() has sized the rings (the
+            // OSC listener starts before the device's channel-count report
+            // does). That's the normal startup window, not a dropped frame.
+            return;
+        }
+        if s.data.len() != self.rings.len() || s.data.iter().any(|v| !(*v as f32).is_finite()) {
             self.dropped_frames += 1;
             self.touch();
             return;
@@ -428,6 +434,20 @@ mod tests {
         // Still measuring from the one good offset, not from a garbage floor.
         live.note_metric_time(101_000.0, 101_000);
         assert_eq!(live.snapshot(10).metric_staleness_ms, Some(0));
+    }
+
+    #[test]
+    fn push_raw_before_configure_is_not_a_dropped_frame() {
+        let mut live = Live::new();
+        // No configure() call: rings are unsized, mirroring the window
+        // between the OSC listener starting and the device-info reply.
+        live.push_raw(&RawSample { timestamp: 1, marker: 0, data: vec![1.0, 2.0] });
+        assert_eq!(live.snapshot(10).dropped_frames, 0);
+
+        // A genuine width mismatch after configuration still counts.
+        live.configure(info(2));
+        live.push_raw(&RawSample { timestamp: 2, marker: 0, data: vec![1.0, 2.0, 3.0] });
+        assert_eq!(live.snapshot(10).dropped_frames, 1);
     }
 
     #[test]
