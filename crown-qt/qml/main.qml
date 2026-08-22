@@ -109,9 +109,11 @@ ApplicationWindow {
                     // reads as current status instead. `raw_enabled` is set
                     // before the BLE state machine ever leaves `Disconnected`
                     // (see backoff.rs), so unlike the old BLE-notification
-                    // path there is no startup window to wait out here: "Raw:
-                    // off" once active means the OSC listener already failed
-                    // to bind, not that it hasn't landed yet.
+                    // path there is no startup window to wait out here.
+                    // "Raw: off" while active is therefore settled, but it is
+                    // two facts at once: either it was never switched on
+                    // before `start()`, or the listener failed to bind. Only
+                    // stderr separates them.
                     text: crown.active
                         ? (crown.raw ? "Raw: on" : "Raw: off")
                         : (crown.raw ? "Raw (next session): on" : "Raw (next session): off")
