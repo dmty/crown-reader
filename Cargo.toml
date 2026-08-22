@@ -15,3 +15,14 @@ chrono = "0.4"
 anyhow = "1"
 dotenvy = "0.15"
 rosc = "0.11"
+
+# Line tables keep backtraces useful and shrink what the linker and any
+# on-access file scanner have to chew through on every rebuild.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies change roughly never, so pay for optimizing them once. Our own
+# crates stay at opt-level 0 so edit-rebuild stays fast. Takes the dev
+# `crown-qt` binary from ~30 MB to ~12 MB.
+[profile.dev.package."*"]
+opt-level = 2
