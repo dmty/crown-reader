@@ -16,8 +16,7 @@ anyhow = "1"
 dotenvy = "0.15"
 rosc = "0.11"
 
-# Line tables keep backtraces useful and shrink what the linker and any
-# on-access file scanner have to chew through on every rebuild.
+# Line tables keep backtraces useful without paying for debug info we don't use.
 [profile.dev]
 debug = "line-tables-only"
 
