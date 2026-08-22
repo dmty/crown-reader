@@ -7,9 +7,8 @@ edition = "2021"
 crown-core = { path = "../crown-core" }
 cxx = "1"
 cxx-qt = "0.9.1"
-# `full` adds Qt<->third-party conversions we never call, including the `image`
-# crate twice. `qt_full` is qt_gui + qt_qml + qt_quickcontrols, which is all the
-# QML imports need.
+# `full` also pulls in unused Qt<->third-party conversions (e.g. the `image`
+# crate, twice); `qt_full` alone covers everything this app's QML imports use.
 cxx-qt-lib = { version = "0.9.1", features = ["qt_full"] }
 tokio.workspace = true
 dotenvy.workspace = true
