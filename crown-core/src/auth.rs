@@ -53,6 +53,11 @@ pub struct Credentials {
     pub device_id: String,
 }
 
+pub struct SignIn {
+    pub id_token: String,
+    pub local_id: String,
+}
+
 impl Credentials {
     pub fn from_env() -> Result<Self, AuthError> {
         let get = |k: &str| std::env::var(k).map_err(|_| AuthError::MissingEnv(k.to_string()));
@@ -64,16 +69,29 @@ impl Credentials {
     }
 }
 
-pub fn parse_sign_in(body: &str) -> Result<String, AuthError> {
+pub fn parse_sign_in(body: &str) -> Result<SignIn, AuthError> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|e| AuthError::Malformed(e.to_string()))?;
     if let Some(msg) = v.pointer("/error/message").and_then(|m| m.as_str()) {
         return Err(AuthError::Remote(msg.to_string()));
     }
-    v.get("idToken")
+    let id_token = v
+        .get("idToken")
         .and_then(|t| t.as_str())
         .map(str::to_string)
-        .ok_or_else(|| AuthError::Malformed("no idToken field".into()))
+        .ok_or_else(|| AuthError::Malformed("no idToken field".into()))?;
+    let local_id = v
+        .get("localId")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| AuthError::Malformed("no localId field".into()))?;
+    if local_id.is_empty() {
+        return Err(AuthError::Malformed("no localId field".into()));
+    }
+    Ok(SignIn {
+        id_token,
+        local_id,
+    })
 }
 
 pub fn parse_token_response(body: &str) -> Result<String, AuthError> {
@@ -205,7 +223,7 @@ fn reclassify_by_status(err: AuthError, status: reqwest::StatusCode) -> AuthErro
     }
 }
 
-async fn sign_in(creds: &Credentials, client: &reqwest::Client) -> Result<String, AuthError> {
+async fn sign_in(creds: &Credentials, client: &reqwest::Client) -> Result<SignIn, AuthError> {
     let body = serde_json::json!({
         "email": creds.email,
         "password": creds.password,
@@ -233,11 +251,11 @@ pub async fn mint_token(creds: &Credentials) -> Result<String, AuthError> {
         .timeout(HTTP_TIMEOUT)
         .build()
         .expect("reqwest client with a timeout is always buildable");
-    let id_token = sign_in(creds, &client).await?;
+    let sign_in = sign_in(creds, &client).await?;
     let body = serde_json::json!({ "data": { "deviceId": creds.device_id } });
     let response = client
         .post(CREATE_TOKEN_URL)
-        .bearer_auth(id_token)
+        .bearer_auth(&sign_in.id_token)
         .json(&body)
         .send()
         .await
@@ -255,15 +273,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_id_token_from_sign_in_response() {
+    fn extracts_id_token_and_local_id_from_sign_in_response() {
         let body = r#"{"idToken":"eyJhbGc","email":"a@b.c","localId":"xyz"}"#;
-        assert_eq!(parse_sign_in(body).unwrap(), "eyJhbGc");
+        let parsed = parse_sign_in(body).unwrap();
+        assert_eq!(parsed.id_token, "eyJhbGc");
+        assert_eq!(parsed.local_id, "xyz");
+    }
+
+    #[test]
+    fn sign_in_missing_local_id_is_malformed() {
+        let body = r#"{"idToken":"eyJhbGc","email":"a@b.c"}"#;
+        let err = parse_sign_in(body).err().unwrap();
+        assert!(matches!(err, AuthError::Malformed(_)));
+        assert!(format!("{err}").contains("no localId field"));
     }
 
     #[test]
     fn sign_in_error_is_reported_not_swallowed() {
         let body = r#"{"error":{"code":400,"message":"INVALID_LOGIN_CREDENTIALS"}}"#;
-        let err = parse_sign_in(body).unwrap_err();
+        let err = parse_sign_in(body).err().unwrap();
         assert!(format!("{err}").contains("INVALID_LOGIN_CREDENTIALS"));
     }
 
