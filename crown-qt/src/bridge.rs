@@ -126,8 +126,8 @@ use cxx_qt::CxxQtType;
 use cxx_qt_lib::{QList, QPointF, QString, QStringList};
 
 use crown_core::auth::{
-    password_profile_for_save, AuthMethod, AuthProfileStore, KeyringAuthProfileStore, KeyringStore,
-    TokenCoordinator, TokenStore,
+    password_profile_for_save, AuthMethod, AuthProfile, AuthProfileStore, KeyringAuthProfileStore,
+    KeyringStore, TokenCoordinator, TokenStore,
 };
 use crown_core::record::Recorder;
 use crown_core::state::{ConnectionState, Live};
@@ -608,13 +608,7 @@ impl qobject::CrownBridge {
     pub fn reload_auth_summary(mut self: Pin<&mut Self>) {
         let error = match self.profile_store.load() {
             Ok(Some(profile)) => {
-                let AuthMethod::Password(password) = profile.method();
-                self.as_mut().set_configured(true);
-                self.as_mut().set_authkind(QString::from("password"));
-                self.as_mut().set_email(QString::from(password.email()));
-                self.as_mut()
-                    .set_deviceid(QString::from(profile.device_id()));
-                self.as_mut().set_settingserror(QString::from(""));
+                self.publish_password_profile(&profile);
                 return;
             }
             Ok(None) => String::new(),
@@ -674,7 +668,7 @@ impl qobject::CrownBridge {
             return false;
         }
 
-        self.reload_auth_summary();
+        self.publish_password_profile(&profile);
         true
     }
 
@@ -707,6 +701,16 @@ impl qobject::CrownBridge {
 
         self.reload_auth_summary();
         true
+    }
+
+    fn publish_password_profile(mut self: Pin<&mut Self>, profile: &AuthProfile) {
+        let AuthMethod::Password(password) = profile.method();
+        self.as_mut().set_configured(true);
+        self.as_mut().set_authkind(QString::from("password"));
+        self.as_mut().set_email(QString::from(password.email()));
+        self.as_mut()
+            .set_deviceid(QString::from(profile.device_id()));
+        self.as_mut().set_settingserror(QString::from(""));
     }
 
     fn stop_session(mut self: Pin<&mut Self>) {
