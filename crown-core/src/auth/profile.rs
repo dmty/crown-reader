@@ -50,9 +50,8 @@ impl AuthProfile {
     }
 
     pub fn cache_identity(&self) -> &str {
-        match &self.method {
-            AuthMethod::Password(password) => password.email(),
-        }
+        let AuthMethod::Password(password) = &self.method;
+        password.email()
     }
 
     pub fn method(&self) -> &AuthMethod {
@@ -139,10 +138,10 @@ pub struct KeyringAuthProfileStore;
 
 impl AuthProfileStore for MemoryAuthProfileStore {
     fn load(&self) -> Result<Option<AuthProfile>, ProfileStoreError> {
-        match crate::sync::lock(&self.0).as_deref() {
-            Some(encoded) => decode(encoded).map(Some),
-            None => Ok(None),
-        }
+        crate::sync::lock(&self.0)
+            .as_deref()
+            .map(decode)
+            .transpose()
     }
 
     fn save(&self, profile: &AuthProfile) -> Result<(), ProfileStoreError> {
@@ -156,13 +155,9 @@ impl AuthProfileStore for MemoryAuthProfileStore {
     }
 }
 
-fn profile_entry() -> Result<keyring::Entry, keyring::Error> {
-    keyring::Entry::new(PROFILE_KEYRING_SERVICE, PROFILE_KEYRING_ACCOUNT)
-}
-
 impl AuthProfileStore for KeyringAuthProfileStore {
     fn load(&self) -> Result<Option<AuthProfile>, ProfileStoreError> {
-        let entry = match profile_entry() {
+        let entry = match keyring::Entry::new(PROFILE_KEYRING_SERVICE, PROFILE_KEYRING_ACCOUNT) {
             Ok(entry) => entry,
             Err(keyring::Error::NoEntry) => return Ok(None),
             Err(e) => return Err(ProfileStoreError::Unavailable(e.to_string())),
@@ -176,7 +171,7 @@ impl AuthProfileStore for KeyringAuthProfileStore {
 
     fn save(&self, profile: &AuthProfile) -> Result<(), ProfileStoreError> {
         let encoded = encode(profile)?;
-        match profile_entry() {
+        match keyring::Entry::new(PROFILE_KEYRING_SERVICE, PROFILE_KEYRING_ACCOUNT) {
             Ok(entry) => entry
                 .set_password(&encoded)
                 .map_err(|e| ProfileStoreError::Write(e.to_string())),
@@ -185,7 +180,7 @@ impl AuthProfileStore for KeyringAuthProfileStore {
     }
 
     fn clear(&self) -> Result<(), ProfileStoreError> {
-        let entry = match profile_entry() {
+        let entry = match keyring::Entry::new(PROFILE_KEYRING_SERVICE, PROFILE_KEYRING_ACCOUNT) {
             Ok(entry) => entry,
             Err(keyring::Error::NoEntry) => return Ok(()),
             Err(e) => return Err(ProfileStoreError::Unavailable(e.to_string())),
@@ -212,14 +207,13 @@ struct StoredPassword {
 }
 
 fn encode(profile: &AuthProfile) -> Result<String, ProfileStoreError> {
-    let auth = match &profile.method {
-        AuthMethod::Password(password) => serde_json::to_value(StoredPassword {
-            kind: AUTH_KIND_PASSWORD.to_string(),
-            email: password.email.clone(),
-            password: password.password.clone(),
-        })
-        .map_err(|e| ProfileStoreError::Malformed(e.to_string()))?,
-    };
+    let AuthMethod::Password(password) = &profile.method;
+    let auth = serde_json::to_value(StoredPassword {
+        kind: AUTH_KIND_PASSWORD.to_string(),
+        email: password.email.clone(),
+        password: password.password.clone(),
+    })
+    .map_err(|e| ProfileStoreError::Malformed(e.to_string()))?;
     serde_json::to_string(&StoredProfile {
         version: PROFILE_VERSION,
         device_id: profile.device_id.clone(),
