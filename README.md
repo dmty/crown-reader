@@ -17,15 +17,13 @@ Core knows nothing about Qt, so the UI layer is replaceable.
 - Qt 6 on `PATH` — `crown-qt` only; `crown-core` builds without it
 - A Neurosity account and a paired headset
 
-The GUI opens Settings on first launch and stores the auth profile in the native keyring. `crown-cli` alone reads `NEUROSITY_EMAIL`, `NEUROSITY_PASSWORD`, and `NEUROSITY_DEVICE_ID` from the environment or a `.env` file:
+The GUI opens Settings when no auth profile exists in the keyring, and stores the profile there. `crown-cli` alone reads `NEUROSITY_EMAIL`, `NEUROSITY_PASSWORD`, and `NEUROSITY_DEVICE_ID` from the environment or a `.env` file (working directory or any parent; exported shell variables win; `.env` is gitignored):
 
 ```bash
 cp .env.example .env   # then fill in NEUROSITY_EMAIL, NEUROSITY_PASSWORD, NEUROSITY_DEVICE_ID
 ```
 
-`crown-cli` reads `.env` from the working directory or any parent. Variables already exported in your shell win, and `.env` is gitignored.
-
-The minted BLE token remains separately cached in the keyring, so the app runs offline between mints. The headset accepts one connection at a time — disconnect the Neurosity app first.
+The minted BLE token is cached separately in the keyring, so the app runs offline between mints. The headset accepts one connection at a time — disconnect the Neurosity app first.
 
 ## Running
 
