@@ -41,3 +41,21 @@ impl AuthProvider for PasswordAuthProvider {
         Box::pin(mint_token(&self.credentials))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_provider_uses_profile_identity() {
+        let profile = AuthProfile::password(
+            "reader@example.com".into(),
+            "secret".into(),
+            "device-1".into(),
+        )
+        .unwrap();
+        let provider = PasswordAuthProvider::from_profile(profile);
+        assert_eq!(provider.cache_identity(), "reader@example.com");
+        assert_eq!(provider.device_id(), "device-1");
+    }
+}

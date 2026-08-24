@@ -76,7 +76,8 @@ mod tests {
 
     #[test]
     fn parses_awareness_metric() {
-        let json = r#"{"metric":"awareness","label":"calm","probability":0.42,"timestamp":1700000000000}"#;
+        let json =
+            r#"{"metric":"awareness","label":"calm","probability":0.42,"timestamp":1700000000000}"#;
         let a: Awareness = serde_json::from_str(json).unwrap();
         assert_eq!(a.probability, 0.42);
     }

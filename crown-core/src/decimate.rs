@@ -46,7 +46,9 @@ mod tests {
 
     #[test]
     fn each_pair_is_ordered_and_covers_its_column() {
-        let samples: Vec<f32> = (0..100).map(|i| if i % 2 == 0 { -1.0 } else { 1.0 }).collect();
+        let samples: Vec<f32> = (0..100)
+            .map(|i| if i % 2 == 0 { -1.0 } else { 1.0 })
+            .collect();
         for (lo, hi) in decimate(&samples, 10) {
             assert!(lo <= hi, "min {lo} must not exceed max {hi}");
             assert_eq!((lo, hi), (-1.0, 1.0));
@@ -58,6 +60,9 @@ mod tests {
         let mut samples = vec![0.0f32; 1000];
         samples[517] = 99.0;
         let out = decimate(&samples, 10);
-        assert!(out.iter().any(|&(_, hi)| hi == 99.0), "spike must survive decimation");
+        assert!(
+            out.iter().any(|&(_, hi)| hi == 99.0),
+            "spike must survive decimation"
+        );
     }
 }

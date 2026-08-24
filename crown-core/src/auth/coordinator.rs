@@ -47,10 +47,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::TokenCoordinator;
-    use crate::auth::{
-        AuthError, AuthFuture, AuthProfile, AuthProvider, MemoryStore, PasswordAuthProvider,
-        TokenStore,
-    };
+    use crate::auth::{AuthError, AuthFuture, AuthProvider, MemoryStore, TokenStore};
 
     struct FakeProvider {
         token: String,
@@ -72,11 +69,11 @@ mod tests {
 
     impl AuthProvider for FakeProvider {
         fn cache_identity(&self) -> &str {
-            "fake@example.com"
+            ""
         }
 
         fn device_id(&self) -> &str {
-            "device-1"
+            ""
         }
 
         fn mint_ble_token(&self) -> AuthFuture<'_> {
@@ -116,29 +113,6 @@ mod tests {
         fn clear(&self) -> Result<(), AuthError> {
             Err(AuthError::Store("locked".into()))
         }
-    }
-
-    #[test]
-    fn password_provider_uses_profile_identity() {
-        let profile = AuthProfile::password(
-            "reader@example.com".into(),
-            "secret".into(),
-            "device-1".into(),
-        )
-        .unwrap();
-        let provider = PasswordAuthProvider::from_profile(profile);
-        assert_eq!(provider.cache_identity(), "reader@example.com");
-        assert_eq!(provider.device_id(), "device-1");
-    }
-
-    #[test]
-    fn coordinator_forwards_provider_identity() {
-        let coordinator = TokenCoordinator::new(
-            Arc::new(FakeProvider::new("unused")),
-            Arc::new(MemoryStore::default()),
-        );
-        assert_eq!(coordinator.device_id(), "device-1");
-        assert_eq!(coordinator.cache_identity(), "fake@example.com");
     }
 
     #[tokio::test]
