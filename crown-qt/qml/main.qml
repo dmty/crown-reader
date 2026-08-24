@@ -12,6 +12,9 @@ ApplicationWindow {
     property bool showingSettings: false
 
     function openSettings() {
+        if (showingSettings)
+            return
+        crown.reloadAuthSummary()
         settings.load()
         showingSettings = true
     }
@@ -216,7 +219,9 @@ ApplicationWindow {
 
     Component.onCompleted: {
         crown.reloadAuthSummary()
-        if (!crown.configured)
-            openSettings()
+        if (!crown.configured) {
+            settings.load()
+            showingSettings = true
+        }
     }
 }
