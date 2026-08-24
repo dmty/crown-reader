@@ -38,10 +38,7 @@ mod tests {
     #[test]
     fn splits_multiple_lines_in_one_push() {
         let mut s = Stitcher::default();
-        assert_eq!(
-            s.push(b"one\ntwo\n"),
-            vec!["one".to_string(), "two".to_string()]
-        );
+        assert_eq!(s.push(b"one\ntwo\n"), vec!["one".to_string(), "two".to_string()]);
     }
 
     #[test]

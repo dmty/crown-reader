@@ -9,10 +9,7 @@ pub struct ChannelRing {
 impl ChannelRing {
     pub fn new(cap: usize) -> Self {
         assert!(cap > 0, "capacity must be > 0");
-        Self {
-            cap,
-            data: VecDeque::with_capacity(cap),
-        }
+        Self { cap, data: VecDeque::with_capacity(cap) }
     }
 
     pub fn push(&mut self, v: f32) {

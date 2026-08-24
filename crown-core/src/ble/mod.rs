@@ -182,7 +182,10 @@ async fn scan_for_crown(adapter: &Adapter) -> Result<Peripheral> {
     Err(anyhow!("no Crown or Notion device found within 10 seconds"))
 }
 
-async fn characteristic(p: &Peripheral, uuid: Uuid) -> Result<btleplug::api::Characteristic> {
+async fn characteristic(
+    p: &Peripheral,
+    uuid: Uuid,
+) -> Result<btleplug::api::Characteristic> {
     p.characteristics()
         .into_iter()
         .find(|c| c.uuid == uuid)
@@ -229,12 +232,8 @@ fn record_derived_line(recorder: &Mutex<Option<Recorder>>, uuid: Uuid, line: &st
         _ => return false,
     };
     let mut guard = crate::sync::lock(recorder);
-    let Some(r) = guard.as_mut() else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-        return false;
-    };
+    let Some(r) = guard.as_mut() else { return false };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return false };
     if let Err(e) = r.write_derived(name, &v) {
         eprintln!("warning: recorder stopped, failed to write derived sample: {e}");
         *guard = None;
@@ -273,9 +272,8 @@ async fn write_jwt(p: &Peripheral, auth: &btleplug::api::Characteristic, jwt: &s
         return Ok(());
     };
     let msg = first_err.to_string().to_lowercase();
-    let looks_like_a_length_error = ["length", "mtu", "too long", "exceed"]
-        .iter()
-        .any(|kw| msg.contains(kw));
+    let looks_like_a_length_error =
+        ["length", "mtu", "too long", "exceed"].iter().any(|kw| msg.contains(kw));
     if !looks_like_a_length_error {
         return Err(first_err.into());
     }
@@ -351,11 +349,7 @@ pub async fn authenticate(p: &Peripheral, jwt: &str) -> Result<AuthOutcome> {
         .and_then(|v| v.as_bool())
         .ok_or_else(|| anyhow!("auth response missing boolean: {parsed}"))?;
     let expires_in = parsed.get(1).and_then(|v| v.as_f64());
-    Ok(if ok {
-        AuthOutcome::Accepted(expires_in)
-    } else {
-        AuthOutcome::Rejected
-    })
+    Ok(if ok { AuthOutcome::Accepted(expires_in) } else { AuthOutcome::Rejected })
 }
 
 type Notifications = Pin<Box<dyn futures::Stream<Item = btleplug::api::ValueNotification> + Send>>;
@@ -487,7 +481,8 @@ async fn try_run(
     // allowed to replace the real result from `stream_session`; `run`'s
     // caller needs that result to classify the failure and decide whether
     // to retry.
-    let result = stream_session(&peripheral, live.clone(), creds, store, recorder, &set).await;
+    let result =
+        stream_session(&peripheral, live.clone(), creds, store, recorder, &set).await;
     match tokio::time::timeout(DISCONNECT_TIMEOUT, peripheral.disconnect()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => eprintln!("warning: failed to disconnect from the headset: {e}"),
@@ -538,7 +533,7 @@ async fn stream_session(
             }
             AuthOutcome::Rejected if !retried => {
                 // A cached token can outlive its validity; mint once more, then give up.
-                let _ = store.clear();
+                store.clear();
                 jwt = token(&creds, store.as_ref(), true).await?;
                 retried = true;
             }
@@ -597,7 +592,8 @@ async fn stream_session(
     match tokio::time::timeout(DEVICE_INFO_TIMEOUT, async {
         let mut configured = false;
         while !configured {
-            let Some(n) = next_or_disconnected(&mut notifications, peripheral, &mut liveness).await
+            let Some(n) =
+                next_or_disconnected(&mut notifications, peripheral, &mut liveness).await
             else {
                 return None; // disconnected before deviceInfo ever arrived
             };
@@ -637,15 +633,8 @@ async fn stream_session(
         }
     };
 
-    for uuid in [
-        CHAR_POWER_BY_BAND,
-        CHAR_CALM,
-        CHAR_FOCUS,
-        CHAR_SIGNAL_QUALITY,
-    ] {
-        peripheral
-            .subscribe(&characteristic(peripheral, uuid).await?)
-            .await?;
+    for uuid in [CHAR_POWER_BY_BAND, CHAR_CALM, CHAR_FOCUS, CHAR_SIGNAL_QUALITY] {
+        peripheral.subscribe(&characteristic(peripheral, uuid).await?).await?;
     }
 
     set(ConnectionState::Streaming);

@@ -71,11 +71,7 @@ pub fn decode_raw(packet_bytes: &[u8], device_id: &str) -> Option<OscSample> {
     let timestamp = integer_part.parse::<u64>().ok()?;
 
     Some(OscSample {
-        sample: RawSample {
-            timestamp,
-            marker: 0,
-            data,
-        },
+        sample: RawSample { timestamp, marker: 0, data },
         counter: *counter,
     })
 }
@@ -119,12 +115,7 @@ struct ListenerState {
 
 impl ListenerState {
     fn new(device_id: String, config: FilterConfig) -> Self {
-        Self {
-            device_id,
-            config,
-            filters: Vec::new(),
-            loss: LossTracker::default(),
-        }
+        Self { device_id, config, filters: Vec::new(), loss: LossTracker::default() }
     }
 
     /// Decodes one datagram and applies it. Anything unrecognised is
@@ -172,9 +163,8 @@ impl ListenerState {
         }
 
         if self.filters.len() != decoded.sample.data.len() {
-            self.filters = (0..decoded.sample.data.len())
-                .map(|_| ChannelFilter::new(&self.config))
-                .collect();
+            self.filters =
+                (0..decoded.sample.data.len()).map(|_| ChannelFilter::new(&self.config)).collect();
             // A channel-count change is a session discontinuity -- most
             // plausibly a device restart -- and the wrapping counter starts
             // over too. Without this reset, the first sample after one
@@ -213,10 +203,7 @@ impl ListenerState {
 
         let mut l = crate::sync::lock(live);
         l.dropped_frames += missing;
-        l.push_raw(&RawSample {
-            data: filtered,
-            ..decoded.sample
-        });
+        l.push_raw(&RawSample { data: filtered, ..decoded.sample });
     }
 }
 
@@ -284,12 +271,8 @@ mod tests {
 
     #[test]
     fn decodes_a_sample_from_our_device() {
-        let bytes = raw_packet(
-            DEVICE,
-            [1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0],
-            "1787270434786.832",
-            7,
-        );
+        let bytes = raw_packet(DEVICE, [1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0],
+                               "1787270434786.832", 7);
         let decoded = decode_raw(&bytes, DEVICE).expect("should decode");
         assert_eq!(decoded.counter, 7);
         assert_eq!(decoded.sample.timestamp, 1_787_270_434_786);
@@ -404,11 +387,7 @@ mod tests {
         let mut tracker = LossTracker::default();
         tracker.observe(30);
         assert_eq!(tracker.observe(31), 0);
-        assert_eq!(
-            tracker.observe(0),
-            0,
-            "wrap must not read as 31 lost samples"
-        );
+        assert_eq!(tracker.observe(0), 0, "wrap must not read as 31 lost samples");
         assert_eq!(tracker.observe(1), 0);
     }
 
@@ -486,10 +465,7 @@ mod tests {
         state.handle(&second, &live, &recorder);
         let snap = crate::sync::lock(&live).snapshot(10);
         assert_eq!(snap.raw_samples, 2);
-        assert_eq!(
-            snap.dropped_frames, 2,
-            "the two missing samples must be counted"
-        );
+        assert_eq!(snap.dropped_frames, 2, "the two missing samples must be counted");
     }
 
     #[test]
@@ -501,10 +477,7 @@ mod tests {
         state.handle(b"not osc at all", &live, &recorder);
         let snap = crate::sync::lock(&live).snapshot(10);
         assert_eq!(snap.raw_samples, 0);
-        assert_eq!(
-            snap.dropped_frames, 0,
-            "noise on the port is not a dropped sample"
-        );
+        assert_eq!(snap.dropped_frames, 0, "noise on the port is not a dropped sample");
     }
 
     fn configured_live() -> Arc<Mutex<Live>> {
@@ -540,12 +513,8 @@ mod tests {
                 // The counter increments every iteration regardless of
                 // `dropped` -- it tracks the device's own per-sample clock,
                 // which keeps ticking whether or not the datagram arrives.
-                let bytes = raw_packet(
-                    DEVICE,
-                    [v; 8],
-                    "1787270434786.832",
-                    i as i32 % COUNTER_MODULUS,
-                );
+                let bytes =
+                    raw_packet(DEVICE, [v; 8], "1787270434786.832", i as i32 % COUNTER_MODULUS);
                 state.handle(&bytes, &live, &recorder);
             }
         }
@@ -562,10 +531,7 @@ mod tests {
         let n = (config.sample_rate_hz * 4.0) as usize;
 
         let clean_peak = handled_peak(config.mains_hz, n, false);
-        assert!(
-            clean_peak < 0.1,
-            "undropped mains peak {clean_peak} should be attenuated"
-        );
+        assert!(clean_peak < 0.1, "undropped mains peak {clean_peak} should be attenuated");
 
         let lossy_peak = handled_peak(config.mains_hz, n, true);
         assert!(
@@ -582,22 +548,12 @@ mod tests {
         let recorder = Arc::new(Mutex::new(None));
 
         for i in 0..2048 {
-            let bytes = raw_packet(
-                DEVICE,
-                [1000.0; 8],
-                "1787270434786.832",
-                i % COUNTER_MODULUS,
-            );
+            let bytes = raw_packet(DEVICE, [1000.0; 8], "1787270434786.832", i % COUNTER_MODULUS);
             state.handle(&bytes, &live, &recorder);
         }
 
-        let (_, last) = *crate::sync::lock(&live).snapshot(2048).waveform[0]
-            .last()
-            .unwrap();
-        assert!(
-            last.abs() < 1.0,
-            "a settled DC input should filter near zero, got {last}"
-        );
+        let (_, last) = *crate::sync::lock(&live).snapshot(2048).waveform[0].last().unwrap();
+        assert!(last.abs() < 1.0, "a settled DC input should filter near zero, got {last}");
     }
 
     #[test]

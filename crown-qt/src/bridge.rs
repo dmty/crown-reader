@@ -225,9 +225,7 @@ impl qobject::CrownBridge {
         }
 
         let live = self.live.clone();
-        let store = Arc::new(KeyringStore {
-            account: creds.email.clone(),
-        });
+        let store = Arc::new(KeyringStore { account: creds.email.clone() });
         let recorder = self.recorder.clone();
         // Not `self.raw`: that property can currently be showing this
         // session's own outcome-in-progress (see the field's doc comment)
@@ -241,19 +239,18 @@ impl qobject::CrownBridge {
         // this front end, that place is `last_error`, republished by
         // `tick()` as the `error` property, plus this stderr line for
         // anyone running the GUI from a terminal.
-        let handle = self
-            .runtime
-            .as_ref()
-            .expect("runtime just ensured present")
-            .spawn(async move {
+        let handle = self.runtime.as_ref().expect("runtime just ensured present").spawn(
+            async move {
                 if let Err(e) =
-                    crown_core::backoff::supervise(live, creds, store, raw_enabled, recorder).await
+                    crown_core::backoff::supervise(live, creds, store, raw_enabled, recorder)
+                        .await
                 {
                     let msg = format!("{e:#}");
                     eprintln!("crown-qt: {msg}");
                     *crown_core::sync::lock(&last_error) = Some(msg);
                 }
-            });
+            },
+        );
         self.as_mut().rust_mut().handle = Some(handle);
     }
 
@@ -268,9 +265,7 @@ impl qobject::CrownBridge {
         // its own NOTIFY, so QML re-evaluates on the signal regardless of
         // what `tick()` returns; guarded by a compare so an unchanged ""
         // doesn't refire that signal every 33ms.
-        let error = crown_core::sync::lock(&self.last_error)
-            .clone()
-            .unwrap_or_default();
+        let error = crown_core::sync::lock(&self.last_error).clone().unwrap_or_default();
         let error = QString::from(error);
         if error != *self.error() {
             self.as_mut().set_error(error);
@@ -327,11 +322,7 @@ impl qobject::CrownBridge {
         // `raw_requested` — never the outcome an *earlier* session may have
         // just written into this same property, which `start()` correctly
         // never reads but a human looking at the button still would.
-        let raw = if active {
-            snap.raw_enabled
-        } else {
-            self.raw_requested
-        };
+        let raw = if active { snap.raw_enabled } else { self.raw_requested };
 
         self.as_mut().rust_mut().snapshot = Some(snap);
 
@@ -387,11 +378,7 @@ impl qobject::CrownBridge {
                 // independently and can race or disagree. Warn once per
                 // name rather than every tick, so a real mismatch is
                 // diagnosable without flooding stderr at tick rate.
-                if self
-                    .warned_missing_quality
-                    .borrow_mut()
-                    .insert(name.clone())
-                {
+                if self.warned_missing_quality.borrow_mut().insert(name.clone()) {
                     eprintln!(
                         "crown-qt: channel '{name}' is in device-info but has no entry in the quality map"
                     );
@@ -436,9 +423,7 @@ impl qobject::CrownBridge {
     pub fn waveform(&self, channel: i32, height: f64) -> QList<QPointF> {
         let mut out = QList::<QPointF>::default();
         let Some(s) = &self.snapshot else { return out };
-        let Some(idx) = usize::try_from(channel).ok() else {
-            return out;
-        };
+        let Some(idx) = usize::try_from(channel).ok() else { return out };
         let Some(column) = s.waveform.get(idx) else {
             return out;
         };

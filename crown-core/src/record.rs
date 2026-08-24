@@ -72,10 +72,7 @@ impl Recorder {
         // `Live::configure` caps it, rather than trusting the caller to
         // have already done it — means the three agree by construction no
         // matter what `info` was built from.
-        let columns = info
-            .channels
-            .min(info.channel_names.len())
-            .min(MAX_CHANNELS);
+        let columns = info.channels.min(info.channel_names.len()).min(MAX_CHANNELS);
         if columns == 0 {
             // `Live::configure` makes the matching call for the same
             // reason: applying a zero-channel report leaves nothing usable
@@ -114,13 +111,7 @@ impl Recorder {
         });
         new_file(&dir.join("meta.json"))?.write_all(&serde_json::to_vec_pretty(&meta)?)?;
 
-        Ok(Self {
-            dir,
-            raw,
-            derived,
-            columns,
-            clock_anchor_written: false,
-        })
+        Ok(Self { dir, raw, derived, columns, clock_anchor_written: false })
     }
 
     pub fn dir(&self) -> &Path {
@@ -235,19 +226,11 @@ mod tests {
 
     #[test]
     fn writes_meta_raw_header_and_rows() {
-        let root = std::env::temp_dir().join(format!(
-            "crown-test-{}-writes_meta_raw_header_and_rows",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir()
+            .join(format!("crown-test-{}-writes_meta_raw_header_and_rows", std::process::id()));
         let mut rec = Recorder::start(&root, &info(), "session-a").unwrap();
-        rec.write_raw(&RawSample {
-            timestamp: 10,
-            marker: 0,
-            data: vec![1.5, -2.5],
-        })
-        .unwrap();
-        rec.write_derived("calm", &serde_json::json!({"probability": 0.5}))
-            .unwrap();
+        rec.write_raw(&RawSample { timestamp: 10, marker: 0, data: vec![1.5, -2.5] }).unwrap();
+        rec.write_derived("calm", &serde_json::json!({"probability": 0.5})).unwrap();
         drop(rec);
 
         let dir = root.join("session-a");
@@ -269,10 +252,7 @@ mod tests {
     #[test]
     fn session_names_are_filesystem_safe() {
         let name = Recorder::session_name();
-        assert!(
-            !name.contains(':'),
-            "colons break on some filesystems: {name}"
-        );
+        assert!(!name.contains(':'), "colons break on some filesystems: {name}");
         assert!(name.len() >= 10);
     }
 
@@ -285,11 +265,7 @@ mod tests {
         let mut rec = Recorder::start(&root, &info(), "session-width").unwrap();
 
         let err = rec
-            .write_raw(&RawSample {
-                timestamp: 1,
-                marker: 0,
-                data: vec![1.0, 2.0, 3.0],
-            })
+            .write_raw(&RawSample { timestamp: 1, marker: 0, data: vec![1.0, 2.0, 3.0] })
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         drop(rec);
@@ -297,40 +273,25 @@ mod tests {
         // The rejected sample must not have left a malformed row behind.
         let dir = root.join("session-width");
         let raw = std::fs::read_to_string(dir.join("raw.csv")).unwrap();
-        assert_eq!(
-            raw.lines().count(),
-            1,
-            "only the header, no row from the rejected sample"
-        );
+        assert_eq!(raw.lines().count(), 1, "only the header, no row from the rejected sample");
 
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn start_reconciles_channels_and_channel_names_like_live_configure_does() {
-        let root = std::env::temp_dir().join(format!(
-            "crown-test-{}-start_reconciles_channels",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir()
+            .join(format!("crown-test-{}-start_reconciles_channels", std::process::id()));
         let mut mismatched = info();
         mismatched.channels = 6; // claims 6 channels but only reports 2 names
         let mut rec = Recorder::start(&root, &mismatched, "session-reconcile").unwrap();
 
         // The header and meta.json must agree on the reconciled count (2),
         // not the claimed one (6) — so a 2-value sample is accepted...
-        rec.write_raw(&RawSample {
-            timestamp: 1,
-            marker: 0,
-            data: vec![1.0, 2.0],
-        })
-        .unwrap();
+        rec.write_raw(&RawSample { timestamp: 1, marker: 0, data: vec![1.0, 2.0] }).unwrap();
         // ...and a sample sized to the claimed-but-unreconciled count is not.
         let err = rec
-            .write_raw(&RawSample {
-                timestamp: 2,
-                marker: 0,
-                data: vec![1.0; 6],
-            })
+            .write_raw(&RawSample { timestamp: 2, marker: 0, data: vec![1.0; 6] })
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         drop(rec);
@@ -349,18 +310,10 @@ mod tests {
 
     #[test]
     fn start_refuses_to_clobber_an_existing_session() {
-        let root = std::env::temp_dir().join(format!(
-            "crown-test-{}-start_refuses_to_clobber",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir()
+            .join(format!("crown-test-{}-start_refuses_to_clobber", std::process::id()));
         let mut first = Recorder::start(&root, &info(), "session-noclobber").unwrap();
-        first
-            .write_raw(&RawSample {
-                timestamp: 10,
-                marker: 0,
-                data: vec![1.5, -2.5],
-            })
-            .unwrap();
+        first.write_raw(&RawSample { timestamp: 10, marker: 0, data: vec![1.5, -2.5] }).unwrap();
         drop(first);
 
         // A second `start` for the same root/name — e.g. a same-second
@@ -371,37 +324,25 @@ mod tests {
 
         let dir = root.join("session-noclobber");
         let raw = std::fs::read_to_string(dir.join("raw.csv")).unwrap();
-        assert_eq!(
-            raw.lines().nth(1).unwrap(),
-            "10,1.5,-2.5",
-            "first session's data must survive"
-        );
+        assert_eq!(raw.lines().nth(1).unwrap(), "10,1.5,-2.5", "first session's data must survive");
 
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn start_rejects_a_session_name_that_could_escape_root() {
-        let root = std::env::temp_dir().join(format!(
-            "crown-test-{}-start_rejects_a_session_name",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir()
+            .join(format!("crown-test-{}-start_rejects_a_session_name", std::process::id()));
         for bad in ["..", "../elsewhere", "nested/path", ""] {
             let err = Recorder::start(&root, &info(), bad).unwrap_err();
-            assert_eq!(
-                err.kind(),
-                io::ErrorKind::InvalidInput,
-                "name {bad:?} should be rejected"
-            );
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "name {bad:?} should be rejected");
         }
     }
 
     #[test]
     fn start_caps_channels_at_max_channels_like_live_configure_does() {
-        let root = std::env::temp_dir().join(format!(
-            "crown-test-{}-start_caps_channels_at_max",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir()
+            .join(format!("crown-test-{}-start_caps_channels_at_max", std::process::id()));
         let mut huge = info();
         huge.channels = 1000;
         huge.channel_names = (0..1000).map(|i| format!("CH{i}")).collect();
@@ -410,18 +351,9 @@ mod tests {
         // Reconciliation must stop at MAX_CHANNELS (64), the same bound
         // `Live::configure` applies — not at `channel_names.len()` (1000),
         // which would produce a header wider than `Live`'s rings ever emit.
-        rec.write_raw(&RawSample {
-            timestamp: 1,
-            marker: 0,
-            data: vec![0.0; 64],
-        })
-        .unwrap();
+        rec.write_raw(&RawSample { timestamp: 1, marker: 0, data: vec![0.0; 64] }).unwrap();
         let err = rec
-            .write_raw(&RawSample {
-                timestamp: 2,
-                marker: 0,
-                data: vec![0.0; 1000],
-            })
+            .write_raw(&RawSample { timestamp: 2, marker: 0, data: vec![0.0; 1000] })
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         drop(rec);
@@ -439,10 +371,8 @@ mod tests {
 
     #[test]
     fn start_rejects_a_device_info_with_zero_usable_channels() {
-        let root = std::env::temp_dir().join(format!(
-            "crown-test-{}-start_rejects_zero_usable_channels",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir()
+            .join(format!("crown-test-{}-start_rejects_zero_usable_channels", std::process::id()));
 
         let mut empty_names = info();
         empty_names.channel_names = vec![];
@@ -461,40 +391,20 @@ mod tests {
 
     #[test]
     fn first_raw_write_anchors_the_clocks_in_derived_jsonl() {
-        let root = std::env::temp_dir().join(format!(
-            "crown-test-{}-first_raw_write_anchors_the_clocks",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir()
+            .join(format!("crown-test-{}-first_raw_write_anchors_the_clocks", std::process::id()));
         let mut rec = Recorder::start(&root, &info(), "session-anchor").unwrap();
 
-        rec.write_raw(&RawSample {
-            timestamp: 987_654,
-            marker: 0,
-            data: vec![1.0, 2.0],
-        })
-        .unwrap();
-        rec.write_raw(&RawSample {
-            timestamp: 987_655,
-            marker: 0,
-            data: vec![1.0, 2.0],
-        })
-        .unwrap();
+        rec.write_raw(&RawSample { timestamp: 987_654, marker: 0, data: vec![1.0, 2.0] }).unwrap();
+        rec.write_raw(&RawSample { timestamp: 987_655, marker: 0, data: vec![1.0, 2.0] }).unwrap();
         drop(rec);
 
         let dir = root.join("session-anchor");
         let derived = std::fs::read_to_string(dir.join("derived.jsonl")).unwrap();
         let lines: Vec<&str> = derived.lines().collect();
-        assert_eq!(
-            lines.len(),
-            1,
-            "the anchor is written once, on the first raw sample only"
-        );
+        assert_eq!(lines.len(), 1, "the anchor is written once, on the first raw sample only");
         assert!(lines[0].contains("\"stream\":\"clockAnchor\""));
-        assert!(
-            lines[0].contains("\"value\":987654"),
-            "anchor must carry the device timestamp: {}",
-            lines[0]
-        );
+        assert!(lines[0].contains("\"value\":987654"), "anchor must carry the device timestamp: {}", lines[0]);
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -509,22 +419,13 @@ mod tests {
         // below — nothing here ever calls flush() explicitly.
         let n: u64 = 2000;
         for i in 0..n {
-            rec.write_raw(&RawSample {
-                timestamp: i,
-                marker: 0,
-                data: vec![1.5, -2.5],
-            })
-            .unwrap();
+            rec.write_raw(&RawSample { timestamp: i, marker: 0, data: vec![1.5, -2.5] }).unwrap();
         }
         drop(rec);
 
         let dir = root.join("session-b");
         let raw = std::fs::read_to_string(dir.join("raw.csv")).unwrap();
-        assert_eq!(
-            raw.lines().count(),
-            n as usize + 1,
-            "header plus every row must survive drop"
-        );
+        assert_eq!(raw.lines().count(), n as usize + 1, "header plus every row must survive drop");
         assert_eq!(raw.lines().last().unwrap(), format!("{},1.5,-2.5", n - 1));
 
         std::fs::remove_dir_all(&root).unwrap();

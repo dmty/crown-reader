@@ -77,10 +77,7 @@ const MIN_STREAMING_FOR_RESET: Duration = Duration::from_secs(10);
 ///   (locked keychain, a permissions hiccup), which can clear up without
 ///   user action. Transient.
 fn is_terminal(err: &AuthError) -> bool {
-    matches!(
-        err,
-        AuthError::MissingEnv(_) | AuthError::Remote(_) | AuthError::Malformed(_)
-    )
+    matches!(err, AuthError::MissingEnv(_) | AuthError::Remote(_) | AuthError::Malformed(_))
 }
 
 /// Same question as [`is_terminal`], for the `anyhow::Error` shape
@@ -229,8 +226,7 @@ pub async fn supervise(
 
         let streamed_long_enough = {
             let l = crate::sync::lock(&live);
-            l.streaming_since
-                .is_some_and(|since| since.elapsed() >= MIN_STREAMING_FOR_RESET)
+            l.streaming_since.is_some_and(|since| since.elapsed() >= MIN_STREAMING_FOR_RESET)
         };
 
         // Logged before the state flips to Reconnecting below, so a human
@@ -307,23 +303,17 @@ mod tests {
 
     #[test]
     fn missing_env_var_is_terminal() {
-        assert!(is_terminal(&AuthError::MissingEnv(
-            "NEUROSITY_PASSWORD".into()
-        )));
+        assert!(is_terminal(&AuthError::MissingEnv("NEUROSITY_PASSWORD".into())));
     }
 
     #[test]
     fn a_rejection_from_the_identity_service_is_terminal() {
-        assert!(is_terminal(&AuthError::Remote(
-            "INVALID_LOGIN_CREDENTIALS".into()
-        )));
+        assert!(is_terminal(&AuthError::Remote("INVALID_LOGIN_CREDENTIALS".into())));
     }
 
     #[test]
     fn a_response_that_does_not_parse_as_expected_is_terminal() {
-        assert!(is_terminal(&AuthError::Malformed(
-            "no idToken field".into()
-        )));
+        assert!(is_terminal(&AuthError::Malformed("no idToken field".into())));
     }
 
     #[test]
