@@ -106,6 +106,88 @@ pub fn parse_token_response(body: &str) -> Result<String, AuthError> {
         .ok_or_else(|| AuthError::Malformed("no result.token field".into()))
 }
 
+const DATABASE_URL: &str = "https://neurosity-device.firebaseio.com";
+
+#[derive(Debug)]
+pub struct UserDeviceRef {
+    pub device_id: String,
+    pub claimed_on: i64,
+}
+
+#[derive(Debug)]
+pub struct ClaimedDevice {
+    pub device_id: String,
+    pub nickname: String,
+}
+
+fn rtdb_remote_error(v: &serde_json::Value) -> Option<AuthError> {
+    match v.get("error") {
+        Some(serde_json::Value::String(m)) => Some(AuthError::Remote(m.clone())),
+        Some(obj) => obj
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map(|m| AuthError::Remote(m.to_string())),
+        None => None,
+    }
+}
+
+pub fn parse_user_devices(body: &str) -> Result<Vec<UserDeviceRef>, AuthError> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| AuthError::Malformed(e.to_string()))?;
+    if let Some(err) = rtdb_remote_error(&v) {
+        return Err(err);
+    }
+    if v.is_null() {
+        return Ok(Vec::new());
+    }
+    let map = v
+        .as_object()
+        .ok_or_else(|| AuthError::Malformed("user devices is not an object".into()))?;
+    let mut out: Vec<UserDeviceRef> = map
+        .iter()
+        .map(|(id, meta)| UserDeviceRef {
+            device_id: id.clone(),
+            claimed_on: meta.get("claimedOn").and_then(|n| n.as_i64()).unwrap_or(0),
+        })
+        .collect();
+    out.sort_by_key(|d| (d.claimed_on, d.device_id.clone()));
+    Ok(out)
+}
+
+pub fn parse_device_info(
+    body: &str,
+    fallback_id: &str,
+) -> Result<Option<ClaimedDevice>, AuthError> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| AuthError::Malformed(e.to_string()))?;
+    if let Some(err) = rtdb_remote_error(&v) {
+        return Err(err);
+    }
+    if v.is_null() {
+        return Ok(None);
+    }
+    let obj = v
+        .as_object()
+        .ok_or_else(|| AuthError::Malformed("device info is not an object".into()))?;
+    let device_id = obj
+        .get("deviceId")
+        .and_then(|id| id.as_str())
+        .filter(|id| !id.is_empty())
+        .unwrap_or(fallback_id)
+        .to_string();
+    let nickname = obj
+        .get("deviceNickname")
+        .and_then(|n| n.as_str())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(device_id.as_str())
+        .to_string();
+    Ok(Some(ClaimedDevice {
+        device_id,
+        nickname,
+    }))
+}
+
 pub trait TokenStore: Send + Sync {
     fn load(&self) -> Option<String>;
     fn save(&self, token: &str) -> Result<(), AuthError>;
@@ -378,6 +460,59 @@ mod tests {
             reqwest::StatusCode::NOT_FOUND,
         );
         assert!(matches!(reclassified, AuthError::Malformed(_)));
+    }
+
+    #[test]
+    fn user_devices_null_and_empty_object_are_empty_lists() {
+        assert!(parse_user_devices("null").unwrap().is_empty());
+        assert!(parse_user_devices("{}").unwrap().is_empty());
+    }
+
+    #[test]
+    fn user_devices_sort_by_claimed_on_ascending() {
+        let body = r#"{"later":{"claimedOn":20},"earlier":{"claimedOn":10},"missing":{}}"#;
+        let parsed = parse_user_devices(body).unwrap();
+        let ids: Vec<_> = parsed.iter().map(|d| d.device_id.as_str()).collect();
+        assert_eq!(ids, ["missing", "earlier", "later"]);
+        assert_eq!(parsed[0].claimed_on, 0);
+    }
+
+    #[test]
+    fn rtdb_string_error_is_remote() {
+        let err = parse_user_devices(r#"{"error":"Permission denied"}"#).unwrap_err();
+        assert!(matches!(err, AuthError::Remote(m) if m == "Permission denied"));
+    }
+
+    #[test]
+    fn device_info_null_is_skipped() {
+        assert!(parse_device_info("null", "abc").unwrap().is_none());
+    }
+
+    #[test]
+    fn device_info_uses_nickname_or_falls_back_to_id() {
+        let named = parse_device_info(
+            r#"{"deviceId":"abc","deviceNickname":"Kitchen Crown"}"#,
+            "abc",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(named.device_id, "abc");
+        assert_eq!(named.nickname, "Kitchen Crown");
+
+        let unnamed = parse_device_info(r#"{"deviceId":"abc"}"#, "abc")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unnamed.nickname, "abc");
+
+        let key_only = parse_device_info("{}", "from-path").unwrap().unwrap();
+        assert_eq!(key_only.device_id, "from-path");
+        assert_eq!(key_only.nickname, "from-path");
+    }
+
+    #[test]
+    fn device_info_string_error_is_remote() {
+        let err = parse_device_info(r#"{"error":"Permission denied"}"#, "abc").unwrap_err();
+        assert!(matches!(err, AuthError::Remote(_)));
     }
 
     #[test]
