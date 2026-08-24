@@ -95,8 +95,8 @@ impl fmt::Display for ProfileStoreError {
         match self {
             Self::Unavailable(_) => write!(f, "profile store unavailable"),
             Self::Malformed(_) => write!(f, "malformed profile"),
-            Self::UnsupportedVersion(v) => write!(f, "unsupported profile version {v}"),
-            Self::UnsupportedMethod(kind) => write!(f, "unsupported auth method {kind}"),
+            Self::UnsupportedVersion(_) => write!(f, "unsupported profile version"),
+            Self::UnsupportedMethod(_) => write!(f, "unsupported auth method"),
             Self::Write(_) => write!(f, "failed to write profile"),
             Self::Delete(_) => write!(f, "failed to delete profile"),
             Self::InvalidInput(field) => write!(f, "invalid {field}"),
