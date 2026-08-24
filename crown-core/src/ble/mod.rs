@@ -533,7 +533,7 @@ async fn stream_session(
             }
             AuthOutcome::Rejected if !retried => {
                 // A cached token can outlive its validity; mint once more, then give up.
-                store.clear();
+                let _ = store.clear();
                 jwt = token(&creds, store.as_ref(), true).await?;
                 retried = true;
             }
