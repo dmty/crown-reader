@@ -21,7 +21,6 @@ Page {
     }
 
     Column {
-        id: form
         width: Math.min(parent.width - 40, 900)
         anchors.horizontalCenter: parent.horizontalCenter
         y: 16
