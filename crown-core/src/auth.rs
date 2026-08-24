@@ -313,6 +313,10 @@ fn device_info_url(device_id: &str) -> String {
     format!("{DATABASE_URL}/devices/{device_id}/info.json")
 }
 
+fn http_error(e: reqwest::Error) -> AuthError {
+    AuthError::Http(e.without_url().to_string())
+}
+
 async fn rtdb_get(
     client: &reqwest::Client,
     url: &str,
@@ -323,12 +327,12 @@ async fn rtdb_get(
         .query(&[("auth", id_token)])
         .send()
         .await
-        .map_err(|e| AuthError::Http(e.to_string()))?;
+        .map_err(http_error)?;
     let status = response.status();
     let text = response
         .text()
         .await
-        .map_err(|e| AuthError::Http(e.to_string()))?;
+        .map_err(http_error)?;
     if !status.is_success() {
         let err = rtdb_remote_error(
             &serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
@@ -591,6 +595,26 @@ mod tests {
         let body = r#"{"result":{}}"#;
         let err = parse_token_response(body).unwrap_err();
         assert!(format!("{err}").contains("no result.token field"));
+    }
+
+    #[tokio::test]
+    async fn rtdb_http_error_omits_auth_query_from_url() {
+        // reqwest attaches the full request URL (including ?auth=) to errors;
+        // https_only rejects http:// before any network I/O.
+        let client = reqwest::Client::builder()
+            .https_only(true)
+            .timeout(HTTP_TIMEOUT)
+            .build()
+            .unwrap();
+        let err = client
+            .get("http://neurosity-device.firebaseio.com/users/u/devices.json")
+            .query(&[("auth", "FAKE-SECRET-TOKEN")])
+            .send()
+            .await
+            .unwrap_err();
+        let formatted = format!("{}", http_error(err));
+        assert!(!formatted.contains("FAKE-SECRET-TOKEN"));
+        assert!(!formatted.contains("auth="));
     }
 
     #[test]
