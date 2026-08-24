@@ -307,7 +307,9 @@ impl qobject::CrownBridge {
         // its own NOTIFY, so QML re-evaluates on the signal regardless of
         // what `tick()` returns; guarded by a compare so an unchanged ""
         // doesn't refire that signal every 33ms.
-        let error = crown_core::sync::lock(&self.last_error).clone().unwrap_or_default();
+        let error = crown_core::sync::lock(&self.last_error)
+            .clone()
+            .unwrap_or_default();
         let error = QString::from(error);
         if error != *self.error() {
             self.as_mut().set_error(error);
@@ -364,7 +366,11 @@ impl qobject::CrownBridge {
         // `raw_requested` — never the outcome an *earlier* session may have
         // just written into this same property, which `start()` correctly
         // never reads but a human looking at the button still would.
-        let raw = if active { snap.raw_enabled } else { self.raw_requested };
+        let raw = if active {
+            snap.raw_enabled
+        } else {
+            self.raw_requested
+        };
 
         self.as_mut().rust_mut().snapshot = Some(snap);
 
@@ -420,7 +426,11 @@ impl qobject::CrownBridge {
                 // independently and can race or disagree. Warn once per
                 // name rather than every tick, so a real mismatch is
                 // diagnosable without flooding stderr at tick rate.
-                if self.warned_missing_quality.borrow_mut().insert(name.clone()) {
+                if self
+                    .warned_missing_quality
+                    .borrow_mut()
+                    .insert(name.clone())
+                {
                     eprintln!(
                         "crown-qt: channel '{name}' is in device-info but has no entry in the quality map"
                     );
@@ -465,7 +475,9 @@ impl qobject::CrownBridge {
     pub fn waveform(&self, channel: i32, height: f64) -> QList<QPointF> {
         let mut out = QList::<QPointF>::default();
         let Some(s) = &self.snapshot else { return out };
-        let Some(idx) = usize::try_from(channel).ok() else { return out };
+        let Some(idx) = usize::try_from(channel).ok() else {
+            return out;
+        };
         let Some(column) = s.waveform.get(idx) else {
             return out;
         };
@@ -593,14 +605,7 @@ impl qobject::CrownBridge {
     }
 
     pub fn reload_auth_summary(mut self: Pin<&mut Self>) {
-        match self.profile_store.load() {
-            Ok(None) => {
-                self.as_mut().set_configured(false);
-                self.as_mut().set_authkind(QString::from(""));
-                self.as_mut().set_email(QString::from(""));
-                self.as_mut().set_deviceid(QString::from(""));
-                self.as_mut().set_settingserror(QString::from(""));
-            }
+        let error = match self.profile_store.load() {
             Ok(Some(profile)) => {
                 let AuthMethod::Password(password) = profile.method();
                 self.as_mut().set_configured(true);
@@ -609,16 +614,16 @@ impl qobject::CrownBridge {
                 self.as_mut()
                     .set_deviceid(QString::from(profile.device_id()));
                 self.as_mut().set_settingserror(QString::from(""));
+                return;
             }
-            Err(error) => {
-                self.as_mut().set_configured(false);
-                self.as_mut().set_authkind(QString::from(""));
-                self.as_mut().set_email(QString::from(""));
-                self.as_mut().set_deviceid(QString::from(""));
-                self.as_mut()
-                    .set_settingserror(QString::from(format!("{error}")));
-            }
-        }
+            Ok(None) => String::new(),
+            Err(error) => format!("{error}"),
+        };
+        self.as_mut().set_configured(false);
+        self.as_mut().set_authkind(QString::from(""));
+        self.as_mut().set_email(QString::from(""));
+        self.as_mut().set_deviceid(QString::from(""));
+        self.as_mut().set_settingserror(QString::from(error));
     }
 
     pub fn save_password_auth(
@@ -639,8 +644,10 @@ impl qobject::CrownBridge {
         let email = email.to_string();
         let password = password.to_string();
         let device_id = device_id.to_string();
-        let old_identity = existing.as_ref().map(|p| p.cache_identity().to_string());
-        let old_device_id = existing.as_ref().map(|p| p.device_id().to_string());
+        let stale_account = existing.as_ref().and_then(|profile| {
+            (email.trim() != profile.cache_identity() || device_id.trim() != profile.device_id())
+                .then(|| profile.cache_identity().to_string())
+        });
 
         let profile = match password_profile_for_save(existing, &email, &password, &device_id) {
             Ok(profile) => profile,
@@ -651,14 +658,13 @@ impl qobject::CrownBridge {
             }
         };
 
-        if let (Some(old_identity), Some(old_device_id)) = (old_identity, old_device_id) {
-            if old_identity != profile.cache_identity() || old_device_id != profile.device_id() {
-                if let Err(error) = KeyringStore::new(old_identity).clear() {
-                    self.as_mut()
-                        .set_settingserror(QString::from(format!("{error}")));
-                    return false;
-                }
-            }
+        if let Err(error) = stale_account
+            .map(|account| KeyringStore::new(account).clear())
+            .transpose()
+        {
+            self.as_mut()
+                .set_settingserror(QString::from(format!("{error}")));
+            return false;
         }
 
         if let Err(error) = self.profile_store.save(&profile) {
@@ -683,12 +689,13 @@ impl qobject::CrownBridge {
             }
         };
 
-        if let Some(profile) = existing {
-            if let Err(error) = KeyringStore::new(profile.cache_identity()).clear() {
-                self.as_mut()
-                    .set_settingserror(QString::from(format!("{error}")));
-                return false;
-            }
+        if let Err(error) = existing
+            .map(|profile| KeyringStore::new(profile.cache_identity()).clear())
+            .transpose()
+        {
+            self.as_mut()
+                .set_settingserror(QString::from(format!("{error}")));
+            return false;
         }
 
         if let Err(error) = self.profile_store.clear() {
