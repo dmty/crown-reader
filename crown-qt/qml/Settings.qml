@@ -63,14 +63,19 @@ Page {
             Button {
                 text: qsTr("Save")
                 onClicked: {
-                    if (root.bridge.savePasswordAuth(emailField.text, passwordField.text, deviceField.text))
+                    if (root.bridge.savePasswordAuth(emailField.text, passwordField.text, deviceField.text)) {
+                        passwordField.text = ""
                         root.saved()
+                    }
                 }
             }
 
             Button {
                 text: qsTr("Cancel")
-                onClicked: root.cancelled()
+                onClicked: {
+                    passwordField.text = ""
+                    root.cancelled()
+                }
             }
 
             Button {

@@ -1,8 +1,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::watch;
+
 use crate::auth::{AuthError, TokenCoordinator};
-use crate::ble::DeviceRejectedToken;
+use crate::ble::{self, DeviceRejectedToken};
 use crate::record::Recorder;
 use crate::state::{ConnectionState, Live};
 
@@ -139,6 +141,7 @@ pub async fn supervise(
     auth: Arc<TokenCoordinator>,
     raw_enabled: bool,
     recorder: Arc<Mutex<Option<Recorder>>>,
+    stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let adapter = match crate::ble::first_adapter().await {
         Ok(a) => a,
@@ -203,7 +206,25 @@ pub async fn supervise(
 
     let mut attempt = 0u32;
     loop {
-        let result = crate::ble::run(&adapter, live.clone(), auth.clone(), recorder.clone()).await;
+        if ble::is_stopped(&stop) {
+            let mut l = crate::sync::lock(&live);
+            l.connection = ConnectionState::Disconnected;
+            l.touch();
+            return Ok(());
+        }
+
+        let result = ble::run(
+            &adapter,
+            live.clone(),
+            auth.clone(),
+            recorder.clone(),
+            stop.clone(),
+        )
+        .await;
+
+        if ble::is_stopped(&stop) {
+            return Ok(());
+        }
 
         if result.as_ref().is_err_and(error_is_terminal) {
             let mut l = crate::sync::lock(&live);
@@ -234,7 +255,15 @@ pub async fn supervise(
         }
 
         let should_reset = result.is_ok() && streamed_long_enough;
-        tokio::time::sleep(next_delay(&mut attempt, should_reset)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(next_delay(&mut attempt, should_reset)) => {}
+            _ = ble::stopped(&stop) => {
+                let mut l = crate::sync::lock(&live);
+                l.connection = ConnectionState::Disconnected;
+                l.touch();
+                return Ok(());
+            }
+        }
     }
 }
 

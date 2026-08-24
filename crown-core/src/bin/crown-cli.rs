@@ -31,9 +31,13 @@ async fn main() {
     let live = Arc::new(Mutex::new(Live::new()));
     let recorder = Arc::new(Mutex::new(None));
 
+    let (stop, rx) = crown_core::ble::Stop::pair();
     let worker = tokio::spawn({
         let live = live.clone();
-        async move { backoff::supervise(live, auth, raw_enabled, recorder).await }
+        async move {
+            let _stop = stop;
+            backoff::supervise(live, auth, raw_enabled, recorder, rx).await
+        }
     });
 
     let started = Instant::now();

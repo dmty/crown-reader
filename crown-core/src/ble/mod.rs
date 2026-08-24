@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, WriteType};
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::auth::TokenCoordinator;
@@ -71,7 +72,63 @@ const DEVICE_INFO_TIMEOUT: Duration = Duration::from_secs(15);
 /// peripheral already being gone is exactly the case that hangs), is the
 /// only way to bound this without patching btleplug itself. Do not delete
 /// this timeout as unneeded caution — it is load-bearing.
-const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+pub const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone)]
+pub struct Stop(watch::Sender<bool>);
+
+impl Stop {
+    pub fn pair() -> (Self, watch::Receiver<bool>) {
+        let (tx, rx) = watch::channel(false);
+        (Self(tx), rx)
+    }
+
+    pub fn request(&self) {
+        let _ = self.0.send(true);
+    }
+}
+
+#[derive(Debug)]
+pub struct SessionStopped;
+
+impl std::fmt::Display for SessionStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session stopped")
+    }
+}
+
+impl std::error::Error for SessionStopped {}
+
+pub fn is_stopped(stop: &watch::Receiver<bool>) -> bool {
+    *stop.borrow()
+}
+
+pub async fn stopped(stop: &watch::Receiver<bool>) {
+    let mut stop = stop.clone();
+    let _ = stop.wait_for(|v| *v).await;
+}
+
+async fn sleep_unless_stopped(duration: Duration, stop: &watch::Receiver<bool>) -> bool {
+    let mut stop = stop.clone();
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => false,
+        _ = stop.wait_for(|v| *v) => true,
+    }
+}
+
+pub async fn request_stop_and_join(
+    stop: &Stop,
+    mut handle: tokio::task::JoinHandle<()>,
+    limit: Duration,
+) {
+    stop.request();
+    tokio::select! {
+        _ = &mut handle => {}
+        _ = tokio::time::sleep(limit) => {
+            handle.abort();
+        }
+    }
+}
 
 // These bounds cover the auth read, the deviceInfo wait, and the
 // disconnect specifically — they are not a general guarantee that
@@ -156,19 +213,21 @@ async fn clear_stale_cache(adapter: &Adapter) {
 /// CoreBluetooth tolerates a redundant `start_scan`, so this was never a
 /// correctness bug — but there is no reason to lean on that tolerance when
 /// stopping cleanly is this cheap.
-pub async fn find_crown(adapter: &Adapter) -> Result<Peripheral> {
+pub async fn find_crown(adapter: &Adapter, stop: &watch::Receiver<bool>) -> Result<Peripheral> {
     clear_stale_cache(adapter).await;
     adapter.start_scan(ScanFilter::default()).await?;
-    let result = scan_for_crown(adapter).await;
+    let result = scan_for_crown(adapter, stop).await;
     if let Err(e) = adapter.stop_scan().await {
         eprintln!("warning: failed to stop the Bluetooth scan: {e}");
     }
     result
 }
 
-async fn scan_for_crown(adapter: &Adapter) -> Result<Peripheral> {
+async fn scan_for_crown(adapter: &Adapter, stop: &watch::Receiver<bool>) -> Result<Peripheral> {
     for _ in 0..20 {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        if sleep_unless_stopped(Duration::from_millis(500), stop).await {
+            return Err(SessionStopped.into());
+        }
         for p in adapter.peripherals().await? {
             let name = match p.properties().await? {
                 Some(props) => props.local_name.unwrap_or_default(),
@@ -382,6 +441,7 @@ async fn next_or_disconnected(
     notifications: &mut Notifications,
     peripheral: &Peripheral,
     liveness: &mut tokio::time::Interval,
+    stop: &watch::Receiver<bool>,
 ) -> Option<btleplug::api::ValueNotification> {
     loop {
         tokio::select! {
@@ -396,6 +456,7 @@ async fn next_or_disconnected(
                     return None;
                 }
             }
+            _ = stopped(stop) => return None,
         }
     }
 }
@@ -428,9 +489,10 @@ pub async fn run(
     live: Arc<Mutex<Live>>,
     auth: Arc<TokenCoordinator>,
     recorder: Arc<Mutex<Option<Recorder>>>,
+    stop: watch::Receiver<bool>,
 ) -> Result<()> {
     let live_for_failure = live.clone();
-    let result = try_run(adapter, live, auth, recorder).await;
+    let result = try_run(adapter, live, auth, recorder, &stop).await;
     if result.is_err() {
         let mut l = crate::sync::lock(&live_for_failure);
         l.connection = ConnectionState::Failed;
@@ -444,6 +506,7 @@ async fn try_run(
     live: Arc<Mutex<Live>>,
     auth: Arc<TokenCoordinator>,
     recorder: Arc<Mutex<Option<Recorder>>>,
+    stop: &watch::Receiver<bool>,
 ) -> Result<()> {
     // `streaming_since` is managed here, alongside `connection`, rather than
     // by the caller: `Scanning` marks the start of a fresh attempt and
@@ -471,7 +534,14 @@ async fn try_run(
     };
 
     set(ConnectionState::Scanning);
-    let peripheral = find_crown(adapter).await?;
+    let peripheral = match find_crown(adapter, stop).await {
+        Ok(peripheral) => peripheral,
+        Err(error) if error.is::<SessionStopped>() => {
+            set(ConnectionState::Disconnected);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
 
     // Every exit from here down — a clean disconnect, an error partway
     // through, or the terminal double-rejection path alike — must release
@@ -485,7 +555,7 @@ async fn try_run(
     // allowed to replace the real result from `stream_session`; `run`'s
     // caller needs that result to classify the failure and decide whether
     // to retry.
-    let result = stream_session(&peripheral, live.clone(), auth, recorder, &set).await;
+    let result = stream_session(&peripheral, live.clone(), auth, recorder, &set, stop).await;
     match tokio::time::timeout(DISCONNECT_TIMEOUT, peripheral.disconnect()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => eprintln!("warning: failed to disconnect from the headset: {e}"),
@@ -512,6 +582,7 @@ async fn stream_session(
     // `&Arc<Mutex<Live>>` (itself `Send + Sync`), which would otherwise make
     // this whole future `!Send` and reject it at `tokio::spawn`.
     set: &(dyn Fn(ConnectionState) + Send + Sync),
+    stop: &watch::Receiver<bool>,
 ) -> Result<()> {
     set(ConnectionState::Connecting);
     peripheral.connect().await?;
@@ -596,7 +667,8 @@ async fn stream_session(
     match tokio::time::timeout(DEVICE_INFO_TIMEOUT, async {
         let mut configured = false;
         while !configured {
-            let Some(n) = next_or_disconnected(&mut notifications, peripheral, &mut liveness).await
+            let Some(n) =
+                next_or_disconnected(&mut notifications, peripheral, &mut liveness, stop).await
             else {
                 return None; // disconnected before deviceInfo ever arrived
             };
@@ -652,7 +724,8 @@ async fn stream_session(
     let mut metric_probe = MetricProbe::new();
 
     loop {
-        let Some(n) = next_or_disconnected(&mut notifications, peripheral, &mut liveness).await
+        let Some(n) =
+            next_or_disconnected(&mut notifications, peripheral, &mut liveness, stop).await
         else {
             break;
         };
@@ -706,4 +779,76 @@ async fn stream_session(
 
     set(ConnectionState::Disconnected);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn stop_is_observable_while_waiting() {
+        let (stop, rx) = Stop::pair();
+        let wait = tokio::spawn(async move {
+            stopped(&rx).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        stop.request();
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("stop should complete a waiter")
+            .expect("waiter should not panic");
+    }
+
+    #[tokio::test]
+    async fn scan_wait_stops_before_full_sleep() {
+        let (stop, rx) = Stop::pair();
+        let started = Instant::now();
+        let wait = tokio::spawn(async move {
+            for _ in 0..20 {
+                if sleep_unless_stopped(Duration::from_millis(500), &rx).await {
+                    return true;
+                }
+            }
+            false
+        });
+        stop.request();
+        let stopped = tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("scan wait should observe stop")
+            .expect("scan wait should not panic");
+        assert!(stopped);
+        assert!(started.elapsed() < Duration::from_millis(400));
+    }
+
+    #[tokio::test]
+    async fn request_stop_waits_for_cleanup_before_returning() {
+        let (stop, rx) = Stop::pair();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let handle = tokio::spawn({
+            let order = order.clone();
+            async move {
+                stopped(&rx).await;
+                order.lock().expect("order").push("stopped");
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                order.lock().expect("order").push("cleaned");
+            }
+        });
+        request_stop_and_join(&stop, handle, Duration::from_secs(1)).await;
+        order.lock().expect("order").push("joined");
+        assert_eq!(
+            order.lock().expect("order").as_slice(),
+            ["stopped", "cleaned", "joined"]
+        );
+    }
+
+    #[tokio::test]
+    async fn request_stop_does_not_block_indefinitely_when_task_ignores_stop() {
+        let (stop, _rx) = Stop::pair();
+        let handle = tokio::spawn(std::future::pending::<()>());
+        let started = Instant::now();
+        request_stop_and_join(&stop, handle, Duration::from_millis(50)).await;
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
 }

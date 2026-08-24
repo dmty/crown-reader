@@ -8,8 +8,10 @@ mod provider;
 
 pub use coordinator::TokenCoordinator;
 pub use profile::{
-    password_profile_for_save, AuthMethod, AuthProfile, AuthProfileStore, KeyringAuthProfileStore,
-    MemoryAuthProfileStore, PasswordAuth, ProfileStoreError,
+    identity_or_device_changed, password_profile_for_save, plan_confirmed_clear,
+    recover_cache_identity, AuthMethod, AuthProfile, AuthProfileStore, ConfirmedClear,
+    KeyringAuthProfileStore, MemoryAuthProfileStore, PasswordAuth, ProfileStoreError,
+    ORPHAN_BLE_TOKEN_WARNING,
 };
 pub use provider::{AuthFuture, AuthProvider, PasswordAuthProvider};
 

@@ -104,6 +104,57 @@ impl fmt::Display for ProfileStoreError {
     }
 }
 
+impl ProfileStoreError {
+    pub fn allows_confirmed_clear(&self) -> bool {
+        matches!(
+            self,
+            Self::Malformed(_) | Self::UnsupportedVersion(_) | Self::UnsupportedMethod(_)
+        )
+    }
+}
+
+pub const ORPHAN_BLE_TOKEN_WARNING: &str =
+    "A cached Bluetooth token could not be identified and may still be stored.";
+
+pub fn identity_or_device_changed(profile: &AuthProfile, email: &str, device_id: &str) -> bool {
+    email.trim() != profile.cache_identity() || device_id.trim() != profile.device_id()
+}
+
+pub fn recover_cache_identity(raw: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let email = value.get("auth")?.get("email")?.as_str()?.trim();
+    (!email.is_empty()).then(|| email.to_string())
+}
+
+pub struct ConfirmedClear {
+    pub token_account: Option<String>,
+    pub orphan_token_warning: bool,
+}
+
+pub fn plan_confirmed_clear(
+    loaded: Result<Option<AuthProfile>, ProfileStoreError>,
+    raw: Option<&str>,
+) -> Result<ConfirmedClear, ProfileStoreError> {
+    match loaded {
+        Ok(Some(profile)) => Ok(ConfirmedClear {
+            token_account: Some(profile.cache_identity().to_string()),
+            orphan_token_warning: false,
+        }),
+        Ok(None) => Ok(ConfirmedClear {
+            token_account: None,
+            orphan_token_warning: false,
+        }),
+        Err(error) if error.allows_confirmed_clear() => {
+            let token_account = raw.and_then(recover_cache_identity);
+            Ok(ConfirmedClear {
+                orphan_token_warning: token_account.is_none(),
+                token_account,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn password_profile_for_save(
     existing: Option<AuthProfile>,
     email: &str,
@@ -152,6 +203,21 @@ impl AuthProfileStore for MemoryAuthProfileStore {
     fn clear(&self) -> Result<(), ProfileStoreError> {
         *crate::sync::lock(&self.0) = None;
         Ok(())
+    }
+}
+
+impl KeyringAuthProfileStore {
+    pub fn load_raw(&self) -> Result<Option<String>, ProfileStoreError> {
+        let entry = match keyring::Entry::new(PROFILE_KEYRING_SERVICE, PROFILE_KEYRING_ACCOUNT) {
+            Ok(entry) => entry,
+            Err(keyring::Error::NoEntry) => return Ok(None),
+            Err(e) => return Err(ProfileStoreError::Unavailable(e.to_string())),
+        };
+        match entry.get_password() {
+            Ok(encoded) => Ok(Some(encoded)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(ProfileStoreError::Unavailable(e.to_string())),
+        }
     }
 }
 
@@ -320,5 +386,122 @@ mod tests {
         store.clear().unwrap();
         store.clear().unwrap();
         assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn malformed_json_is_malformed() {
+        assert!(matches!(decode("{"), Err(ProfileStoreError::Malformed(_))));
+        assert!(matches!(
+            decode("not json"),
+            Err(ProfileStoreError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn save_replaces_the_complete_profile() {
+        let store = MemoryAuthProfileStore::default();
+        store.save(&password_profile()).unwrap();
+        let replacement = AuthProfile::password(
+            "new@example.com".into(),
+            "new-secret".into(),
+            "device-2".into(),
+        )
+        .unwrap();
+        store.save(&replacement).unwrap();
+        let loaded = store.load().unwrap().unwrap();
+        assert_eq!(loaded.cache_identity(), "new@example.com");
+        assert_eq!(loaded.device_id(), "device-2");
+        let AuthMethod::Password(password) = loaded.method();
+        assert_eq!(password.password(), "new-secret");
+    }
+
+    #[test]
+    fn corrupt_load_errors_allow_confirmed_clear() {
+        assert!(ProfileStoreError::Malformed("bad json".into()).allows_confirmed_clear());
+        assert!(ProfileStoreError::UnsupportedVersion(2).allows_confirmed_clear());
+        assert!(ProfileStoreError::UnsupportedMethod("oauth".into()).allows_confirmed_clear());
+        assert!(!ProfileStoreError::Unavailable("locked".into()).allows_confirmed_clear());
+    }
+
+    #[test]
+    fn email_or_device_change_is_an_identity_edit() {
+        let profile = password_profile();
+        assert!(identity_or_device_changed(
+            &profile,
+            "other@example.com",
+            "device-1"
+        ));
+        assert!(identity_or_device_changed(
+            &profile,
+            "reader@example.com",
+            "device-2"
+        ));
+        assert!(!identity_or_device_changed(
+            &profile,
+            "reader@example.com",
+            "device-1"
+        ));
+        assert!(!identity_or_device_changed(
+            &profile,
+            " reader@example.com ",
+            "device-1"
+        ));
+    }
+
+    #[test]
+    fn recover_cache_identity_reads_email_from_corrupt_documents() {
+        assert_eq!(
+            recover_cache_identity(
+                r#"{"version":2,"device_id":"d","auth":{"kind":"password","email":"reader@example.com","password":"x"}}"#
+            )
+            .as_deref(),
+            Some("reader@example.com")
+        );
+        assert_eq!(
+            recover_cache_identity(
+                r#"{"version":1,"device_id":"d","auth":{"kind":"oauth","email":" reader@example.com "}}"#
+            )
+            .as_deref(),
+            Some("reader@example.com")
+        );
+        assert_eq!(recover_cache_identity("{"), None);
+        assert_eq!(
+            recover_cache_identity(r#"{"version":1,"auth":{"kind":"password","email":"  "}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn confirmed_clear_deletes_corrupt_profiles_and_warns_when_identity_is_lost() {
+        let profile = password_profile();
+        let planned = plan_confirmed_clear(Ok(Some(profile)), None).unwrap();
+        assert_eq!(planned.token_account.as_deref(), Some("reader@example.com"));
+        assert!(!planned.orphan_token_warning);
+
+        let unavailable = plan_confirmed_clear(
+            Err(ProfileStoreError::Unavailable("locked".into())),
+            Some(r#"{"auth":{"email":"reader@example.com"}}"#),
+        );
+        assert!(matches!(
+            unavailable,
+            Err(ProfileStoreError::Unavailable(_))
+        ));
+
+        let recovered = plan_confirmed_clear(
+            Err(ProfileStoreError::UnsupportedMethod("oauth".into())),
+            Some(r#"{"version":1,"auth":{"kind":"oauth","email":"reader@example.com"}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            recovered.token_account.as_deref(),
+            Some("reader@example.com")
+        );
+        assert!(!recovered.orphan_token_warning);
+
+        let orphan =
+            plan_confirmed_clear(Err(ProfileStoreError::Malformed("bad".into())), Some("{"))
+                .unwrap();
+        assert_eq!(orphan.token_account, None);
+        assert!(orphan.orphan_token_warning);
     }
 }

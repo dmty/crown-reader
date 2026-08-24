@@ -126,8 +126,9 @@ use cxx_qt::CxxQtType;
 use cxx_qt_lib::{QList, QPointF, QString, QStringList};
 
 use crown_core::auth::{
-    password_profile_for_save, AuthMethod, AuthProfile, AuthProfileStore, KeyringAuthProfileStore,
-    KeyringStore, TokenCoordinator, TokenStore,
+    identity_or_device_changed, password_profile_for_save, plan_confirmed_clear, AuthMethod,
+    AuthProfile, AuthProfileStore, KeyringAuthProfileStore, KeyringStore, TokenCoordinator,
+    TokenStore, ORPHAN_BLE_TOKEN_WARNING,
 };
 use crown_core::record::Recorder;
 use crown_core::state::{ConnectionState, Live};
@@ -160,6 +161,7 @@ pub struct CrownBridgeRust {
     recorder: Arc<Mutex<Option<Recorder>>>,
     runtime: Option<tokio::runtime::Runtime>,
     handle: Option<tokio::task::JoinHandle<()>>,
+    session_stop: Option<crown_core::ble::Stop>,
     // The user's actual pending choice for the *next* session, set only by
     // `toggle_raw`. This is what `start()` reads — never the `raw` property,
     // which `tick()` overwrites with the current session's outcome while
@@ -207,6 +209,7 @@ impl Default for CrownBridgeRust {
             recorder: Arc::new(Mutex::new(None)),
             runtime: None,
             handle: None,
+            session_stop: None,
             last_error: Arc::new(Mutex::new(None)),
             raw_requested: false,
             last_rev: None,
@@ -281,20 +284,25 @@ impl qobject::CrownBridge {
         // this front end, that place is `last_error`, republished by
         // `tick()` as the `error` property, plus this stderr line for
         // anyone running the GUI from a terminal.
+        let _ = self.as_mut().rust_mut().session_stop.take();
+        let _ = self.as_mut().rust_mut().handle.take();
+        let (stop, rx) = crown_core::ble::Stop::pair();
         let handle = self
             .runtime
             .as_ref()
             .expect("runtime just ensured present")
             .spawn(async move {
                 if let Err(e) =
-                    crown_core::backoff::supervise(live, auth, raw_enabled, recorder).await
+                    crown_core::backoff::supervise(live, auth, raw_enabled, recorder, rx).await
                 {
                     let msg = format!("{e:#}");
                     eprintln!("crown-qt: {msg}");
                     *crown_core::sync::lock(&last_error) = Some(msg);
                 }
             });
-        self.as_mut().rust_mut().handle = Some(handle);
+        let mut rust = self.as_mut().rust_mut();
+        rust.session_stop = Some(stop);
+        rust.handle = Some(handle);
     }
 
     pub fn tick(mut self: Pin<&mut Self>, width: i32) -> bool {
@@ -640,7 +648,7 @@ impl qobject::CrownBridge {
         let password = password.to_string();
         let device_id = device_id.to_string();
         let stale_account = existing.as_ref().and_then(|profile| {
-            (email.trim() != profile.cache_identity() || device_id.trim() != profile.device_id())
+            identity_or_device_changed(profile, &email, &device_id)
                 .then(|| profile.cache_identity().to_string())
         });
 
@@ -652,6 +660,10 @@ impl qobject::CrownBridge {
                 return false;
             }
         };
+
+        if stale_account.is_some() {
+            self.as_mut().stop_session();
+        }
 
         if let Err(error) = stale_account
             .map(|account| KeyringStore::new(account).clear())
@@ -675,8 +687,15 @@ impl qobject::CrownBridge {
     pub fn clear_auth(mut self: Pin<&mut Self>) -> bool {
         self.as_mut().stop_session();
 
-        let existing = match self.profile_store.load() {
-            Ok(existing) => existing,
+        let loaded = self.profile_store.load();
+        let raw = match &loaded {
+            Err(error) if error.allows_confirmed_clear() => {
+                self.profile_store.load_raw().ok().flatten()
+            }
+            _ => None,
+        };
+        let planned = match plan_confirmed_clear(loaded, raw.as_deref()) {
+            Ok(planned) => planned,
             Err(error) => {
                 self.as_mut()
                     .set_settingserror(QString::from(format!("{error}")));
@@ -684,8 +703,9 @@ impl qobject::CrownBridge {
             }
         };
 
-        if let Err(error) = existing
-            .map(|profile| KeyringStore::new(profile.cache_identity()).clear())
+        if let Err(error) = planned
+            .token_account
+            .map(|account| KeyringStore::new(account).clear())
             .transpose()
         {
             self.as_mut()
@@ -699,7 +719,12 @@ impl qobject::CrownBridge {
             return false;
         }
 
-        self.reload_auth_summary();
+        let warn = planned.orphan_token_warning;
+        self.as_mut().reload_auth_summary();
+        if warn {
+            self.as_mut()
+                .set_settingserror(QString::from(ORPHAN_BLE_TOKEN_WARNING));
+        }
         true
     }
 
@@ -714,8 +739,24 @@ impl qobject::CrownBridge {
     }
 
     fn stop_session(mut self: Pin<&mut Self>) {
-        if let Some(handle) = self.as_mut().rust_mut().handle.take() {
-            handle.abort();
+        let (stop, handle) = {
+            let mut rust = self.as_mut().rust_mut();
+            (rust.session_stop.take(), rust.handle.take())
+        };
+        match (stop, handle) {
+            (Some(stop), Some(handle)) => {
+                if let Some(runtime) = self.runtime.as_ref() {
+                    runtime.block_on(crown_core::ble::request_stop_and_join(
+                        &stop,
+                        handle,
+                        crown_core::ble::DISCONNECT_TIMEOUT,
+                    ));
+                } else {
+                    handle.abort();
+                }
+            }
+            (_, Some(handle)) => handle.abort(),
+            _ => {}
         }
         *crown_core::sync::lock(&self.recorder) = None;
         let mut live = crown_core::sync::lock(&self.live);
