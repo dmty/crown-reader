@@ -533,7 +533,9 @@ async fn stream_session(
             }
             AuthOutcome::Rejected if !retried => {
                 // A cached token can outlive its validity; mint once more, then give up.
-                let _ = store.clear();
+                if let Err(error) = store.clear() {
+                    eprintln!("warning: could not clear cached Bluetooth token: {error}");
+                }
                 jwt = token(&creds, store.as_ref(), true).await?;
                 retried = true;
             }

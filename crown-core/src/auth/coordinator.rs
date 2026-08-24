@@ -69,11 +69,11 @@ mod tests {
 
     impl AuthProvider for FakeProvider {
         fn cache_identity(&self) -> &str {
-            ""
+            "fake@example.com"
         }
 
         fn device_id(&self) -> &str {
-            ""
+            "device-1"
         }
 
         fn mint_ble_token(&self) -> AuthFuture<'_> {
@@ -113,6 +113,16 @@ mod tests {
         fn clear(&self) -> Result<(), AuthError> {
             Err(AuthError::Store("locked".into()))
         }
+    }
+
+    #[test]
+    fn coordinator_forwards_provider_identity() {
+        let coordinator = TokenCoordinator::new(
+            Arc::new(FakeProvider::new("unused")),
+            Arc::new(MemoryStore::default()),
+        );
+        assert_eq!(coordinator.device_id(), "device-1");
+        assert_eq!(coordinator.cache_identity(), "fake@example.com");
     }
 
     #[tokio::test]
