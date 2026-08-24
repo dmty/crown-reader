@@ -313,13 +313,6 @@ fn device_info_url(device_id: &str) -> String {
     format!("{DATABASE_URL}/devices/{device_id}/info.json")
 }
 
-fn auth_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .expect("reqwest client with a timeout is always buildable")
-}
-
 async fn rtdb_get(
     client: &reqwest::Client,
     url: &str,
@@ -370,15 +363,14 @@ async fn sign_in_email_password(
     parse_sign_in(&text).map_err(|e| reclassify_by_status(e, status))
 }
 
-async fn sign_in(creds: &Credentials, client: &reqwest::Client) -> Result<SignIn, AuthError> {
-    sign_in_email_password(&creds.email, &creds.password, client).await
-}
-
 pub async fn list_claimed_devices(
     email: &str,
     password: &str,
 ) -> Result<Vec<ClaimedDevice>, AuthError> {
-    let client = auth_client();
+    let client = reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .expect("reqwest client with a timeout is always buildable");
     let sign_in = sign_in_email_password(email, password, &client).await?;
     let body = rtdb_get(
         &client,
@@ -403,8 +395,14 @@ pub async fn list_claimed_devices(
 }
 
 pub async fn mint_token(creds: &Credentials) -> Result<String, AuthError> {
-    let client = auth_client();
-    let sign_in = sign_in(creds, &client).await?;
+    // A server that accepts the connection and never responds must not hang
+    // the caller forever; an auth round-trip has no legitimate reason to run
+    // longer than this.
+    let client = reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .expect("reqwest client with a timeout is always buildable");
+    let sign_in = sign_in_email_password(&creds.email, &creds.password, &client).await?;
     let body = serde_json::json!({ "data": { "deviceId": creds.device_id } });
     let response = client
         .post(CREATE_TOKEN_URL)
