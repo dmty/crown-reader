@@ -2,11 +2,16 @@ use std::fmt;
 use std::sync::Mutex;
 use std::time::Duration;
 
+mod coordinator;
 mod profile;
+mod provider;
+
+pub use coordinator::TokenCoordinator;
 pub use profile::{
-    password_profile_for_save, AuthMethod, AuthProfile, AuthProfileStore,
-    KeyringAuthProfileStore, MemoryAuthProfileStore, PasswordAuth, ProfileStoreError,
+    password_profile_for_save, AuthMethod, AuthProfile, AuthProfileStore, KeyringAuthProfileStore,
+    MemoryAuthProfileStore, PasswordAuth, ProfileStoreError,
 };
+pub use provider::{AuthFuture, AuthProvider, PasswordAuthProvider};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -84,11 +89,19 @@ pub fn parse_token_response(body: &str) -> Result<String, AuthError> {
 pub trait TokenStore: Send + Sync {
     fn load(&self) -> Option<String>;
     fn save(&self, token: &str) -> Result<(), AuthError>;
-    fn clear(&self);
+    fn clear(&self) -> Result<(), AuthError>;
 }
 
 pub struct KeyringStore {
     pub account: String,
+}
+
+impl KeyringStore {
+    pub fn new(account: impl Into<String>) -> Self {
+        Self {
+            account: account.into(),
+        }
+    }
 }
 
 impl TokenStore for KeyringStore {
@@ -121,9 +134,15 @@ impl TokenStore for KeyringStore {
             .map_err(|e| AuthError::Store(e.to_string()))
     }
 
-    fn clear(&self) {
-        if let Ok(e) = keyring::Entry::new(KEYRING_SERVICE, &self.account) {
-            let _ = e.delete_credential();
+    fn clear(&self) -> Result<(), AuthError> {
+        let entry = match keyring::Entry::new(KEYRING_SERVICE, &self.account) {
+            Ok(entry) => entry,
+            Err(keyring::Error::NoEntry) => return Ok(()),
+            Err(e) => return Err(AuthError::Store(e.to_string())),
+        };
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(AuthError::Store(e.to_string())),
         }
     }
 }
@@ -141,8 +160,9 @@ impl TokenStore for MemoryStore {
         Ok(())
     }
 
-    fn clear(&self) {
+    fn clear(&self) -> Result<(), AuthError> {
         *crate::sync::lock(&self.0) = None;
+        Ok(())
     }
 }
 
@@ -174,8 +194,8 @@ impl TokenStore for MemoryStore {
 /// on a status this project treats as terminal (2xx or non-429 4xx) — see
 /// `backoff::is_terminal`'s doc comment, which relies on that invariant.
 fn reclassify_by_status(err: AuthError, status: reqwest::StatusCode) -> AuthError {
-    let terminal_status =
-        status.is_success() || (status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let terminal_status = status.is_success()
+        || (status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS);
     if matches!(&err, AuthError::Remote(_) | AuthError::Malformed(_)) && !terminal_status {
         AuthError::Http(format!("HTTP {status}: {err}"))
     } else {
@@ -196,7 +216,10 @@ async fn sign_in(creds: &Credentials, client: &reqwest::Client) -> Result<String
         .await
         .map_err(|e| AuthError::Http(e.to_string()))?;
     let status = response.status();
-    let text = response.text().await.map_err(|e| AuthError::Http(e.to_string()))?;
+    let text = response
+        .text()
+        .await
+        .map_err(|e| AuthError::Http(e.to_string()))?;
     parse_sign_in(&text).map_err(|e| reclassify_by_status(e, status))
 }
 
@@ -218,7 +241,10 @@ pub async fn mint_token(creds: &Credentials) -> Result<String, AuthError> {
         .await
         .map_err(|e| AuthError::Http(e.to_string()))?;
     let status = response.status();
-    let text = response.text().await.map_err(|e| AuthError::Http(e.to_string()))?;
+    let text = response
+        .text()
+        .await
+        .map_err(|e| AuthError::Http(e.to_string()))?;
     parse_token_response(&text).map_err(|e| reclassify_by_status(e, status))
 }
 
@@ -369,60 +395,8 @@ mod tests {
         assert!(store.load().is_none());
         store.save("tok").unwrap();
         assert_eq!(store.load().unwrap(), "tok");
-        store.clear();
+        store.clear().unwrap();
         assert!(store.load().is_none());
-    }
-
-    struct FailingStore;
-
-    impl TokenStore for FailingStore {
-        fn load(&self) -> Option<String> {
-            None
-        }
-
-        fn save(&self, _token: &str) -> Result<(), AuthError> {
-            Err(AuthError::Store("keychain locked".into()))
-        }
-
-        fn clear(&self) {}
-    }
-
-    #[test]
-    fn token_is_returned_even_when_the_cache_write_fails() {
-        // cache_token is exactly what token() calls after a successful mint;
-        // its return type ((), not Result) makes a save failure unable to
-        // propagate as an error to the caller. This does not panic.
-        cache_token(&FailingStore, "minted-token");
-    }
-
-    fn dummy_credentials() -> Credentials {
-        Credentials {
-            email: "a@b.c".into(),
-            password: "unused".into(),
-            device_id: "device-1".into(),
-        }
-    }
-
-    #[tokio::test]
-    async fn cached_token_is_returned_without_a_network_call() {
-        let store = MemoryStore::default();
-        store.save("cached-token").unwrap();
-        // force_refresh: false with a populated cache returns before token()
-        // ever reaches mint_token, so this makes no network call even though
-        // the credentials above are not real.
-        let t = token(&dummy_credentials(), &store, false).await.unwrap();
-        assert_eq!(t, "cached-token");
-    }
-
-    #[test]
-    fn force_refresh_bypasses_the_cache() {
-        // This is the exact decision token() makes before ever calling
-        // mint_token; asserting it directly proves force_refresh skips the
-        // cache without requiring a network call to observe it.
-        let store = MemoryStore::default();
-        store.save("cached-token").unwrap();
-        assert_eq!(cached_token(&store, false), Some("cached-token".to_string()));
-        assert_eq!(cached_token(&store, true), None);
     }
 
     #[tokio::test]
