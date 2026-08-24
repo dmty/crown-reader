@@ -2,6 +2,12 @@ use std::fmt;
 use std::sync::Mutex;
 use std::time::Duration;
 
+mod profile;
+pub use profile::{
+    password_profile_for_save, AuthMethod, AuthProfile, AuthProfileStore,
+    KeyringAuthProfileStore, MemoryAuthProfileStore, PasswordAuth, ProfileStoreError,
+};
+
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 const API_KEY: &str = concat!("AIza", "SyB0TkZ83Fj0CIzn8AAmE-Osc92s3ER8hy8");
