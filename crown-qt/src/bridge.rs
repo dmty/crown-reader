@@ -51,6 +51,11 @@ pub mod qobject {
         // them re-evaluate, since QML can't otherwise see that an invokable's
         // result changed.
         #[qproperty(i32, rev)]
+        #[qproperty(bool, configured)]
+        #[qproperty(QString, authkind)]
+        #[qproperty(QString, email)]
+        #[qproperty(QString, deviceid)]
+        #[qproperty(QString, settingserror)]
         type CrownBridge = super::CrownBridgeRust;
 
         /// Pulls a snapshot and republishes it as Qt properties. Returns
@@ -92,6 +97,23 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "toggleRaw"]
         fn toggle_raw(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        #[cxx_name = "reloadAuthSummary"]
+        fn reload_auth_summary(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        #[cxx_name = "savePasswordAuth"]
+        fn save_password_auth(
+            self: Pin<&mut Self>,
+            email: &QString,
+            password: &QString,
+            device_id: &QString,
+        ) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "clearAuth"]
+        fn clear_auth(self: Pin<&mut Self>) -> bool;
     }
 }
 
@@ -103,7 +125,10 @@ use std::sync::{Arc, Mutex};
 use cxx_qt::CxxQtType;
 use cxx_qt_lib::{QList, QPointF, QString, QStringList};
 
-use crown_core::auth::{Credentials, KeyringStore};
+use crown_core::auth::{
+    password_profile_for_save, AuthMethod, AuthProfileStore, KeyringAuthProfileStore, KeyringStore,
+    TokenCoordinator, TokenStore,
+};
 use crown_core::record::Recorder;
 use crown_core::state::{ConnectionState, Live};
 
@@ -125,6 +150,12 @@ pub struct CrownBridgeRust {
     ready: bool,
     error: QString,
     rev: i32,
+    configured: bool,
+    authkind: QString,
+    email: QString,
+    deviceid: QString,
+    settingserror: QString,
+    profile_store: KeyringAuthProfileStore,
     live: Arc<Mutex<Live>>,
     recorder: Arc<Mutex<Option<Recorder>>>,
     runtime: Option<tokio::runtime::Runtime>,
@@ -166,6 +197,12 @@ impl Default for CrownBridgeRust {
             ready: false,
             error: QString::from(""),
             rev: 0,
+            configured: false,
+            authkind: QString::from(""),
+            email: QString::from(""),
+            deviceid: QString::from(""),
+            settingserror: QString::from(""),
+            profile_store: KeyringAuthProfileStore,
             live: Arc::new(Mutex::new(Live::new())),
             recorder: Arc::new(Mutex::new(None)),
             runtime: None,
@@ -209,15 +246,20 @@ impl qobject::CrownBridge {
         *crown_core::sync::lock(&self.last_error) = None;
         self.as_mut().set_error(QString::from(""));
 
-        let creds = match Credentials::from_env() {
-            Ok(c) => c,
-            Err(e) => {
-                let msg = format!("{e}");
-                eprintln!("crown-qt: {msg}");
-                self.as_mut().set_error(QString::from(msg));
+        let profile = match self.profile_store.load() {
+            Ok(Some(profile)) => profile,
+            Ok(None) => {
+                self.as_mut()
+                    .set_settingserror(QString::from("Neurosity authentication is not configured"));
+                return;
+            }
+            Err(error) => {
+                self.as_mut()
+                    .set_settingserror(QString::from(format!("{error}")));
                 return;
             }
         };
+        let auth = Arc::new(TokenCoordinator::from_profile(profile));
 
         if self.runtime.is_none() {
             let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -225,7 +267,6 @@ impl qobject::CrownBridge {
         }
 
         let live = self.live.clone();
-        let store = Arc::new(KeyringStore { account: creds.email.clone() });
         let recorder = self.recorder.clone();
         // Not `self.raw`: that property can currently be showing this
         // session's own outcome-in-progress (see the field's doc comment)
@@ -239,18 +280,19 @@ impl qobject::CrownBridge {
         // this front end, that place is `last_error`, republished by
         // `tick()` as the `error` property, plus this stderr line for
         // anyone running the GUI from a terminal.
-        let handle = self.runtime.as_ref().expect("runtime just ensured present").spawn(
-            async move {
+        let handle = self
+            .runtime
+            .as_ref()
+            .expect("runtime just ensured present")
+            .spawn(async move {
                 if let Err(e) =
-                    crown_core::backoff::supervise(live, creds, store, raw_enabled, recorder)
-                        .await
+                    crown_core::backoff::supervise(live, auth, raw_enabled, recorder).await
                 {
                     let msg = format!("{e:#}");
                     eprintln!("crown-qt: {msg}");
                     *crown_core::sync::lock(&last_error) = Some(msg);
                 }
-            },
-        );
+            });
         self.as_mut().rust_mut().handle = Some(handle);
     }
 
@@ -548,6 +590,127 @@ impl qobject::CrownBridge {
         let next = !self.raw_requested;
         self.as_mut().rust_mut().raw_requested = next;
         self.as_mut().set_raw(next);
+    }
+
+    pub fn reload_auth_summary(mut self: Pin<&mut Self>) {
+        match self.profile_store.load() {
+            Ok(None) => {
+                self.as_mut().set_configured(false);
+                self.as_mut().set_authkind(QString::from(""));
+                self.as_mut().set_email(QString::from(""));
+                self.as_mut().set_deviceid(QString::from(""));
+                self.as_mut().set_settingserror(QString::from(""));
+            }
+            Ok(Some(profile)) => {
+                let AuthMethod::Password(password) = profile.method();
+                self.as_mut().set_configured(true);
+                self.as_mut().set_authkind(QString::from("password"));
+                self.as_mut().set_email(QString::from(password.email()));
+                self.as_mut()
+                    .set_deviceid(QString::from(profile.device_id()));
+                self.as_mut().set_settingserror(QString::from(""));
+            }
+            Err(error) => {
+                self.as_mut().set_configured(false);
+                self.as_mut().set_authkind(QString::from(""));
+                self.as_mut().set_email(QString::from(""));
+                self.as_mut().set_deviceid(QString::from(""));
+                self.as_mut()
+                    .set_settingserror(QString::from(format!("{error}")));
+            }
+        }
+    }
+
+    pub fn save_password_auth(
+        mut self: Pin<&mut Self>,
+        email: &QString,
+        password: &QString,
+        device_id: &QString,
+    ) -> bool {
+        let existing = match self.profile_store.load() {
+            Ok(existing) => existing,
+            Err(error) => {
+                self.as_mut()
+                    .set_settingserror(QString::from(format!("{error}")));
+                return false;
+            }
+        };
+
+        let email = email.to_string();
+        let password = password.to_string();
+        let device_id = device_id.to_string();
+        let old_identity = existing.as_ref().map(|p| p.cache_identity().to_string());
+        let old_device_id = existing.as_ref().map(|p| p.device_id().to_string());
+
+        let profile = match password_profile_for_save(existing, &email, &password, &device_id) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.as_mut()
+                    .set_settingserror(QString::from(format!("{error}")));
+                return false;
+            }
+        };
+
+        if let (Some(old_identity), Some(old_device_id)) = (old_identity, old_device_id) {
+            if old_identity != profile.cache_identity() || old_device_id != profile.device_id() {
+                if let Err(error) = KeyringStore::new(old_identity).clear() {
+                    self.as_mut()
+                        .set_settingserror(QString::from(format!("{error}")));
+                    return false;
+                }
+            }
+        }
+
+        if let Err(error) = self.profile_store.save(&profile) {
+            self.as_mut()
+                .set_settingserror(QString::from(format!("{error}")));
+            return false;
+        }
+
+        self.reload_auth_summary();
+        true
+    }
+
+    pub fn clear_auth(mut self: Pin<&mut Self>) -> bool {
+        self.as_mut().stop_session();
+
+        let existing = match self.profile_store.load() {
+            Ok(existing) => existing,
+            Err(error) => {
+                self.as_mut()
+                    .set_settingserror(QString::from(format!("{error}")));
+                return false;
+            }
+        };
+
+        if let Some(profile) = existing {
+            if let Err(error) = KeyringStore::new(profile.cache_identity()).clear() {
+                self.as_mut()
+                    .set_settingserror(QString::from(format!("{error}")));
+                return false;
+            }
+        }
+
+        if let Err(error) = self.profile_store.clear() {
+            self.as_mut()
+                .set_settingserror(QString::from(format!("{error}")));
+            return false;
+        }
+
+        self.reload_auth_summary();
+        true
+    }
+
+    fn stop_session(mut self: Pin<&mut Self>) {
+        if let Some(handle) = self.as_mut().rust_mut().handle.take() {
+            handle.abort();
+        }
+        *crown_core::sync::lock(&self.recorder) = None;
+        let mut live = crown_core::sync::lock(&self.live);
+        live.connection = ConnectionState::Disconnected;
+        live.recording = None;
+        live.raw_enabled = false;
+        live.touch();
     }
 }
 
