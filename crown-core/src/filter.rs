@@ -17,7 +17,11 @@ pub struct FilterConfig {
 
 impl Default for FilterConfig {
     fn default() -> Self {
-        Self { mains_hz: 50.0, highpass_hz: 1.0, sample_rate_hz: 256.0 }
+        Self {
+            mains_hz: 50.0,
+            highpass_hz: 1.0,
+            sample_rate_hz: 256.0,
+        }
     }
 }
 
@@ -168,7 +172,10 @@ mod tests {
         let config = FilterConfig::default();
         let mut filter = ChannelFilter::new(&config);
         let attenuated = response(&mut filter, config.mains_hz, config.sample_rate_hz, 4.0);
-        assert!(attenuated < 0.1, "50 Hz peak {attenuated} should be under 0.1");
+        assert!(
+            attenuated < 0.1,
+            "50 Hz peak {attenuated} should be under 0.1"
+        );
     }
 
     #[test]
@@ -179,7 +186,10 @@ mod tests {
         assert!(passed > 0.9, "10 Hz peak {passed} should stay above 0.9");
         // Correct normalization reads ~0.983 here; dropping the /a0 on the
         // biquad coefficients reads ~1.02, so this bound is what pins it.
-        assert!(passed < 1.01, "10 Hz peak {passed} should not be amplified above unity");
+        assert!(
+            passed < 1.01,
+            "10 Hz peak {passed} should not be amplified above unity"
+        );
     }
 
     #[test]
@@ -194,14 +204,23 @@ mod tests {
 
     #[test]
     fn sixty_hertz_mains_is_configurable_not_hardcoded() {
-        let config = FilterConfig { mains_hz: 60.0, ..FilterConfig::default() };
+        let config = FilterConfig {
+            mains_hz: 60.0,
+            ..FilterConfig::default()
+        };
         let mut filter = ChannelFilter::new(&config);
         let attenuated = response(&mut filter, 60.0, config.sample_rate_hz, 4.0);
-        assert!(attenuated < 0.1, "60 Hz peak {attenuated} should be under 0.1");
+        assert!(
+            attenuated < 0.1,
+            "60 Hz peak {attenuated} should be under 0.1"
+        );
         // And the 50 Hz it is no longer tuned to must survive.
         let mut other = ChannelFilter::new(&config);
         let passed = response(&mut other, 50.0, config.sample_rate_hz, 4.0);
-        assert!(passed > 0.5, "50 Hz peak {passed} should survive a 60 Hz notch");
+        assert!(
+            passed > 0.5,
+            "50 Hz peak {passed} should survive a 60 Hz notch"
+        );
     }
 
     #[test]
@@ -220,9 +239,16 @@ mod tests {
     fn the_notch_still_attenuates_when_mistuned_by_a_tenth_of_a_hertz() {
         let config = FilterConfig::default();
         let mut filter = ChannelFilter::new(&config);
-        let attenuated =
-            response(&mut filter, config.mains_hz + 0.1, config.sample_rate_hz, 4.0);
-        assert!(attenuated < 0.1, "mistuned 50.1 Hz peak {attenuated} should still be attenuated");
+        let attenuated = response(
+            &mut filter,
+            config.mains_hz + 0.1,
+            config.sample_rate_hz,
+            4.0,
+        );
+        assert!(
+            attenuated < 0.1,
+            "mistuned 50.1 Hz peak {attenuated} should still be attenuated"
+        );
     }
 
     #[test]

@@ -39,7 +39,10 @@ impl ConnectionState {
     /// their negation rather than a whitelist of the running states: a
     /// value this doesn't recognize should read as active, not idle.
     pub fn is_active(self) -> bool {
-        !matches!(self, ConnectionState::Disconnected | ConnectionState::Failed)
+        !matches!(
+            self,
+            ConnectionState::Disconnected | ConnectionState::Failed
+        )
     }
 }
 
@@ -152,7 +155,10 @@ impl Live {
     /// applied: the previous configuration (or the unconfigured state) is
     /// kept, and the drop is counted via `dropped_frames` so it isn't silent.
     pub fn configure(&mut self, mut info: DeviceInfo) {
-        let channels = info.channels.min(info.channel_names.len()).min(MAX_CHANNELS);
+        let channels = info
+            .channels
+            .min(info.channel_names.len())
+            .min(MAX_CHANNELS);
         if channels == 0 {
             self.dropped_frames += 1;
             self.touch();
@@ -160,7 +166,8 @@ impl Live {
         }
 
         let sampling_rate = if info.sampling_rate.is_finite() {
-            info.sampling_rate.clamp(MIN_SAMPLING_RATE_HZ, MAX_SAMPLING_RATE_HZ)
+            info.sampling_rate
+                .clamp(MIN_SAMPLING_RATE_HZ, MAX_SAMPLING_RATE_HZ)
         } else {
             MIN_SAMPLING_RATE_HZ
         };
@@ -343,7 +350,13 @@ mod tests {
     #[test]
     fn is_active_is_false_only_for_the_two_idle_states() {
         use ConnectionState::*;
-        for s in [Scanning, Connecting, Authenticating, Streaming, Reconnecting] {
+        for s in [
+            Scanning,
+            Connecting,
+            Authenticating,
+            Streaming,
+            Reconnecting,
+        ] {
             assert!(s.is_active(), "{s:?} should be active");
         }
         for s in [Disconnected, Failed] {
@@ -374,7 +387,11 @@ mod tests {
         let mut live = Live::new();
         live.configure(info(2));
         for i in 0..500 {
-            live.push_raw(&RawSample { timestamp: i, marker: 0, data: vec![1.0, -1.0] });
+            live.push_raw(&RawSample {
+                timestamp: i,
+                marker: 0,
+                data: vec![1.0, -1.0],
+            });
         }
         let snap = live.snapshot(10);
         assert_eq!(snap.waveform.len(), 2);
@@ -387,7 +404,11 @@ mod tests {
     fn a_sample_with_the_wrong_channel_count_is_dropped_not_panicked_on() {
         let mut live = Live::new();
         live.configure(info(2));
-        live.push_raw(&RawSample { timestamp: 1, marker: 0, data: vec![1.0, 2.0, 3.0] });
+        live.push_raw(&RawSample {
+            timestamp: 1,
+            marker: 0,
+            data: vec![1.0, 2.0, 3.0],
+        });
         assert_eq!(live.snapshot(10).dropped_frames, 1);
     }
 
@@ -424,7 +445,10 @@ mod tests {
         assert!(snap.device_name.is_none());
         assert!(snap.waveform.is_empty());
         assert!(snap.channel_names.is_empty());
-        assert!(snap.rev > before_rev, "the drop must still be observable via rev");
+        assert!(
+            snap.rev > before_rev,
+            "the drop must still be observable via rev"
+        );
     }
 
     #[test]
@@ -452,7 +476,11 @@ mod tests {
         let mut live = Live::new();
         live.configure(info(2));
         let before = live.snapshot(10).rev;
-        live.push_raw(&RawSample { timestamp: 1, marker: 0, data: vec![1.0, 2.0] });
+        live.push_raw(&RawSample {
+            timestamp: 1,
+            marker: 0,
+            data: vec![1.0, 2.0],
+        });
         assert!(live.snapshot(10).rev > before);
     }
 
@@ -518,12 +546,20 @@ mod tests {
         let mut live = Live::new();
         // No configure() call: rings are unsized, mirroring the window
         // between the OSC listener starting and the device-info reply.
-        live.push_raw(&RawSample { timestamp: 1, marker: 0, data: vec![1.0, 2.0] });
+        live.push_raw(&RawSample {
+            timestamp: 1,
+            marker: 0,
+            data: vec![1.0, 2.0],
+        });
         assert_eq!(live.snapshot(10).dropped_frames, 0);
 
         // A genuine width mismatch after configuration still counts.
         live.configure(info(2));
-        live.push_raw(&RawSample { timestamp: 2, marker: 0, data: vec![1.0, 2.0, 3.0] });
+        live.push_raw(&RawSample {
+            timestamp: 2,
+            marker: 0,
+            data: vec![1.0, 2.0, 3.0],
+        });
         assert_eq!(live.snapshot(10).dropped_frames, 1);
     }
 
@@ -533,11 +569,19 @@ mod tests {
         live.configure(info(2));
         assert_eq!(live.snapshot(10).raw_samples, 0);
 
-        live.push_raw(&RawSample { timestamp: 1, marker: 0, data: vec![1.0, 2.0] });
+        live.push_raw(&RawSample {
+            timestamp: 1,
+            marker: 0,
+            data: vec![1.0, 2.0],
+        });
         assert_eq!(live.snapshot(10).raw_samples, 1);
 
         // Wrong channel count: rejected, must not advance the counter.
-        live.push_raw(&RawSample { timestamp: 2, marker: 0, data: vec![1.0, 2.0, 3.0] });
+        live.push_raw(&RawSample {
+            timestamp: 2,
+            marker: 0,
+            data: vec![1.0, 2.0, 3.0],
+        });
         assert_eq!(live.snapshot(10).raw_samples, 1);
     }
 
@@ -545,9 +589,21 @@ mod tests {
     fn push_raw_drops_a_sample_containing_non_finite_values() {
         let mut live = Live::new();
         live.configure(info(2));
-        live.push_raw(&RawSample { timestamp: 1, marker: 0, data: vec![1.0, f64::NAN] });
-        live.push_raw(&RawSample { timestamp: 2, marker: 0, data: vec![f64::INFINITY, 1.0] });
-        live.push_raw(&RawSample { timestamp: 3, marker: 0, data: vec![f64::NEG_INFINITY, 1.0] });
+        live.push_raw(&RawSample {
+            timestamp: 1,
+            marker: 0,
+            data: vec![1.0, f64::NAN],
+        });
+        live.push_raw(&RawSample {
+            timestamp: 2,
+            marker: 0,
+            data: vec![f64::INFINITY, 1.0],
+        });
+        live.push_raw(&RawSample {
+            timestamp: 3,
+            marker: 0,
+            data: vec![f64::NEG_INFINITY, 1.0],
+        });
         let snap = live.snapshot(10);
         assert_eq!(snap.dropped_frames, 3);
         assert!(snap.waveform[0].is_empty());
@@ -557,11 +613,19 @@ mod tests {
         // let it through — but `as f32` saturates it to +inf, so the guard
         // must check finiteness on the cast value that actually reaches the
         // ring, not on the wire value.
-        live.push_raw(&RawSample { timestamp: 4, marker: 0, data: vec![1e300, 1.0] });
+        live.push_raw(&RawSample {
+            timestamp: 4,
+            marker: 0,
+            data: vec![1e300, 1.0],
+        });
         assert_eq!(live.snapshot(10).dropped_frames, 4);
         assert!(live.snapshot(10).waveform[0].is_empty());
 
-        live.push_raw(&RawSample { timestamp: 5, marker: 0, data: vec![1.0, 2.0] });
+        live.push_raw(&RawSample {
+            timestamp: 5,
+            marker: 0,
+            data: vec![1.0, 2.0],
+        });
         assert!(!live.snapshot(10).waveform[0].is_empty());
     }
 }
