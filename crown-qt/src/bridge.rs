@@ -56,6 +56,8 @@ pub mod qobject {
         #[qproperty(QString, email)]
         #[qproperty(QString, deviceid)]
         #[qproperty(QString, settingserror)]
+        #[qproperty(QStringList, devicelabels)]
+        #[qproperty(QStringList, deviceids)]
         type CrownBridge = super::CrownBridgeRust;
 
         /// Pulls a snapshot and republishes it as Qt properties. Returns
@@ -114,6 +116,18 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "clearAuth"]
         fn clear_auth(self: Pin<&mut Self>) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "listDevices"]
+        fn list_devices(
+            self: Pin<&mut Self>,
+            email: &QString,
+            password: &QString,
+        ) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "deviceIdAt"]
+        fn device_id_at(&self, index: i32) -> QString;
     }
 }
 
@@ -126,9 +140,9 @@ use cxx_qt::CxxQtType;
 use cxx_qt_lib::{QList, QPointF, QString, QStringList};
 
 use crown_core::auth::{
-    identity_or_device_changed, password_profile_for_save, plan_confirmed_clear, AuthMethod,
-    AuthProfile, AuthProfileStore, KeyringAuthProfileStore, KeyringStore, TokenCoordinator,
-    TokenStore, ORPHAN_BLE_TOKEN_WARNING,
+    identity_or_device_changed, list_claimed_devices, password_profile_for_save,
+    plan_confirmed_clear, AuthMethod, AuthProfile, AuthProfileStore, KeyringAuthProfileStore,
+    KeyringStore, TokenCoordinator, TokenStore, ORPHAN_BLE_TOKEN_WARNING,
 };
 use crown_core::record::Recorder;
 use crown_core::state::{ConnectionState, Live};
@@ -156,6 +170,8 @@ pub struct CrownBridgeRust {
     email: QString,
     deviceid: QString,
     settingserror: QString,
+    devicelabels: QStringList,
+    deviceids: QStringList,
     profile_store: KeyringAuthProfileStore,
     live: Arc<Mutex<Live>>,
     recorder: Arc<Mutex<Option<Recorder>>>,
@@ -204,6 +220,8 @@ impl Default for CrownBridgeRust {
             email: QString::from(""),
             deviceid: QString::from(""),
             settingserror: QString::from(""),
+            devicelabels: QStringList::default(),
+            deviceids: QStringList::default(),
             profile_store: KeyringAuthProfileStore,
             live: Arc::new(Mutex::new(Live::new())),
             recorder: Arc::new(Mutex::new(None)),
@@ -627,6 +645,86 @@ impl qobject::CrownBridge {
         self.as_mut().set_email(QString::from(""));
         self.as_mut().set_deviceid(QString::from(""));
         self.as_mut().set_settingserror(QString::from(error));
+        self.as_mut().set_device_lists(&[]);
+    }
+
+    pub fn device_id_at(&self, index: i32) -> QString {
+        let Ok(idx) = usize::try_from(index) else {
+            return QString::from("");
+        };
+        self.deviceids
+            .iter()
+            .nth(idx)
+            .map(|s| QString::from(&s.to_string()))
+            .unwrap_or_else(|| QString::from(""))
+    }
+
+    pub fn list_devices(
+        mut self: Pin<&mut Self>,
+        email: &QString,
+        password: &QString,
+    ) -> bool {
+        let email = email.to_string();
+        let mut password = password.to_string();
+        if password.is_empty() {
+            match self.profile_store.load() {
+                Ok(Some(profile)) => {
+                    let AuthMethod::Password(stored) = profile.method();
+                    password = stored.password().to_string();
+                }
+                Ok(None) => {
+                    self.as_mut()
+                        .set_settingserror(QString::from("invalid password"));
+                    return false;
+                }
+                Err(error) => {
+                    self.as_mut()
+                        .set_settingserror(QString::from(format!("{error}")));
+                    return false;
+                }
+            }
+        }
+
+        if email.trim().is_empty() {
+            self.as_mut()
+                .set_settingserror(QString::from("invalid email"));
+            return false;
+        }
+
+        if self.runtime.is_none() {
+            let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+            self.as_mut().rust_mut().runtime = Some(runtime);
+        }
+
+        let listed = self
+            .runtime
+            .as_ref()
+            .expect("runtime just ensured present")
+            .block_on(list_claimed_devices(&email, &password));
+
+        match listed {
+            Ok(devices) => {
+                if devices.is_empty() {
+                    self.as_mut().set_device_lists(&[]);
+                    self.as_mut().set_settingserror(QString::from(
+                        "No devices claimed on this account",
+                    ));
+                    return false;
+                }
+                let pairs: Vec<(String, String)> = devices
+                    .into_iter()
+                    .map(|d| (d.device_id, d.nickname))
+                    .collect();
+                self.as_mut().set_device_lists(&pairs);
+                self.as_mut().set_settingserror(QString::from(""));
+                true
+            }
+            Err(error) => {
+                self.as_mut()
+                    .set_settingserror(QString::from(format!("{error}")));
+                false
+            }
+        }
     }
 
     pub fn save_password_auth(
@@ -742,6 +840,19 @@ impl qobject::CrownBridge {
         self.as_mut()
             .set_deviceid(QString::from(profile.device_id()));
         self.as_mut().set_settingserror(QString::from(""));
+        let id = profile.device_id().to_string();
+        self.set_device_lists(&[(id.clone(), id)]);
+    }
+
+    fn set_device_lists(mut self: Pin<&mut Self>, devices: &[(String, String)]) {
+        let mut labels = QStringList::default();
+        let mut ids = QStringList::default();
+        for (id, label) in devices {
+            ids.append(QString::from(id.as_str()));
+            labels.append(QString::from(label.as_str()));
+        }
+        self.as_mut().set_deviceids(ids);
+        self.as_mut().set_devicelabels(labels);
     }
 
     fn stop_session(mut self: Pin<&mut Self>) -> bool {
