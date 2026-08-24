@@ -9,9 +9,8 @@ Page {
     signal cancelled()
 
     function selectStoredDevice() {
-        var wanted = bridge.deviceid
         for (var i = 0; i < deviceBox.count; i++) {
-            if (root.bridge.deviceIdAt(i) === wanted) {
+            if (bridge.deviceIdAt(i) === bridge.deviceid) {
                 deviceBox.currentIndex = i
                 return
             }
@@ -57,8 +56,7 @@ Page {
         ComboBox {
             id: deviceBox
             width: parent.width
-            model: root.bridge.devicelabels
-            property var ids: root.bridge.deviceids
+            model: bridge.devicelabels
             enabled: count > 0
             Accessible.name: qsTr("Device")
         }
@@ -66,7 +64,7 @@ Page {
         Button {
             text: qsTr("Load devices")
             onClicked: {
-                if (root.bridge.listDevices(emailField.text, passwordField.text))
+                if (bridge.listDevices(emailField.text, passwordField.text))
                     selectStoredDevice()
             }
         }
@@ -86,8 +84,8 @@ Page {
             Button {
                 text: qsTr("Save")
                 onClicked: {
-                    var deviceId = root.bridge.deviceIdAt(deviceBox.currentIndex)
-                    if (root.bridge.savePasswordAuth(emailField.text, passwordField.text, deviceId)) {
+                    var deviceId = bridge.deviceIdAt(deviceBox.currentIndex)
+                    if (bridge.savePasswordAuth(emailField.text, passwordField.text, deviceId)) {
                         passwordField.text = ""
                         root.saved()
                     }
