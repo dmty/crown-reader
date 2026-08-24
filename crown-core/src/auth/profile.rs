@@ -122,7 +122,14 @@ pub fn identity_or_device_changed(profile: &AuthProfile, email: &str, device_id:
 
 pub fn recover_cache_identity(raw: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let email = value.get("auth")?.get("email")?.as_str()?.trim();
+    if value.get("version")?.as_u64()? != u64::from(PROFILE_VERSION) {
+        return None;
+    }
+    let auth = value.get("auth")?;
+    if auth.get("kind")?.as_str()? != AUTH_KIND_PASSWORD {
+        return None;
+    }
+    let email = auth.get("email")?.as_str()?.trim();
     (!email.is_empty()).then(|| email.to_string())
 }
 
@@ -449,20 +456,36 @@ mod tests {
     }
 
     #[test]
-    fn recover_cache_identity_reads_email_from_corrupt_documents() {
+    fn recover_cache_identity_only_trusts_version_one_password_email() {
         assert_eq!(
             recover_cache_identity(
-                r#"{"version":2,"device_id":"d","auth":{"kind":"password","email":"reader@example.com","password":"x"}}"#
+                r#"{"version":1,"device_id":"d","auth":{"kind":"password","email":" reader@example.com ","password":"x"}}"#
             )
             .as_deref(),
             Some("reader@example.com")
         );
         assert_eq!(
             recover_cache_identity(
-                r#"{"version":1,"device_id":"d","auth":{"kind":"oauth","email":" reader@example.com "}}"#
+                r#"{"version":1,"device_id":"d","auth":{"kind":"password","email":"reader@example.com"}}"#
             )
             .as_deref(),
             Some("reader@example.com")
+        );
+        assert_eq!(
+            recover_cache_identity(
+                r#"{"version":2,"device_id":"d","auth":{"kind":"password","email":"reader@example.com","password":"x"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            recover_cache_identity(
+                r#"{"version":1,"device_id":"d","auth":{"kind":"oauth","email":"reader@example.com"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            recover_cache_identity(r#"{"auth":{"kind":"password","email":"reader@example.com"}}"#),
+            None
         );
         assert_eq!(recover_cache_identity("{"), None);
         assert_eq!(
@@ -487,9 +510,19 @@ mod tests {
             Err(ProfileStoreError::Unavailable(_))
         ));
 
-        let recovered = plan_confirmed_clear(
+        let unsupported = plan_confirmed_clear(
             Err(ProfileStoreError::UnsupportedMethod("oauth".into())),
             Some(r#"{"version":1,"auth":{"kind":"oauth","email":"reader@example.com"}}"#),
+        )
+        .unwrap();
+        assert_eq!(unsupported.token_account, None);
+        assert!(unsupported.orphan_token_warning);
+
+        let recovered = plan_confirmed_clear(
+            Err(ProfileStoreError::Malformed("missing password".into())),
+            Some(
+                r#"{"version":1,"device_id":"d","auth":{"kind":"password","email":"reader@example.com"}}"#,
+            ),
         )
         .unwrap();
         assert_eq!(

@@ -74,6 +74,11 @@ const DEVICE_INFO_TIMEOUT: Duration = Duration::from_secs(15);
 /// this timeout as unneeded caution — it is load-bearing.
 pub const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Cooperative join budget for `request_stop_and_join`. Must exceed
+/// [`DISCONNECT_TIMEOUT`] so abort cannot overlap an in-flight bounded
+/// `peripheral.disconnect()`.
+pub const JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+
 #[derive(Clone)]
 pub struct Stop(watch::Sender<bool>);
 
@@ -126,21 +131,26 @@ pub async fn request_stop_and_join(
         _ = &mut handle => {}
         _ = tokio::time::sleep(limit) => {
             handle.abort();
+            let _ = handle.await;
         }
     }
 }
 
-// These bounds cover the auth read, the deviceInfo wait, and the
-// disconnect specifically — they are not a general guarantee that
-// `Authenticating` (or any other state) is bounded. `connect()`,
-// `discover_services()`, `write_jwt`'s `p.write()`, and every
-// `subscribe()` call below are the same kind of unbounded btleplug await,
-// with the same "only a value or a disconnect resolves it, nothing else"
-// shape, and none of them have a timeout here. A device that acknowledges
-// the connection but never completes one of those calls still hangs the
-// session indefinitely. Known limitation, not addressed in this round —
-// adding timeouts to every btleplug call is a larger change than fits
-// here.
+async fn await_unless_stopped<T>(
+    fut: impl std::future::Future<Output = T>,
+    stop: &watch::Receiver<bool>,
+) -> Result<T, SessionStopped> {
+    tokio::select! {
+        value = fut => Ok(value),
+        _ = stopped(stop) => Err(SessionStopped),
+    }
+}
+
+// Auth read, deviceInfo wait, and disconnect stay time-bounded. `connect()`,
+// `discover_services()`, JWT write, and `subscribe()` are still unbounded
+// btleplug awaits, but stop now races each of them so Clear/Save can return
+// through `try_run`'s disconnect instead of aborting mid-link. A device that
+// never completes one of those calls can still hang an unattended session.
 
 /// Builds the one `Adapter` a caller should hold for the life of a
 /// reconnecting session, rather than a fresh one per attempt.
@@ -585,15 +595,31 @@ async fn stream_session(
     stop: &watch::Receiver<bool>,
 ) -> Result<()> {
     set(ConnectionState::Connecting);
-    peripheral.connect().await?;
-    peripheral.discover_services().await?;
+    let Ok(connected) = await_unless_stopped(peripheral.connect(), stop).await else {
+        set(ConnectionState::Disconnected);
+        return Ok(());
+    };
+    connected?;
+    let Ok(discovered) = await_unless_stopped(peripheral.discover_services(), stop).await else {
+        set(ConnectionState::Disconnected);
+        return Ok(());
+    };
+    discovered?;
     dump_gatt(peripheral);
 
     set(ConnectionState::Authenticating);
-    let mut jwt = auth.token(false).await?;
+    let Ok(token) = await_unless_stopped(auth.token(false), stop).await else {
+        set(ConnectionState::Disconnected);
+        return Ok(());
+    };
+    let mut jwt = token?;
     let mut retried = false;
     loop {
-        match authenticate(peripheral, &jwt).await? {
+        let Ok(outcome) = await_unless_stopped(authenticate(peripheral, &jwt), stop).await else {
+            set(ConnectionState::Disconnected);
+            return Ok(());
+        };
+        match outcome? {
             AuthOutcome::Accepted(_) => break,
             AuthOutcome::NoAnswer => {
                 // Not a rejection: the cached token may be fine and the
@@ -609,7 +635,11 @@ async fn stream_session(
                 if let Err(error) = auth.clear_cache() {
                     eprintln!("warning: could not clear rejected Bluetooth token: {error}");
                 }
-                jwt = auth.token(true).await?;
+                let Ok(token) = await_unless_stopped(auth.token(true), stop).await else {
+                    set(ConnectionState::Disconnected);
+                    return Ok(());
+                };
+                jwt = token?;
                 retried = true;
             }
             AuthOutcome::Rejected => {
@@ -621,7 +651,11 @@ async fn stream_session(
     // The notification stream must exist before any subscribe call: btleplug
     // only delivers notifications that arrive after this call, and a
     // one-shot notification sent right on subscribe would otherwise be lost.
-    let mut notifications = peripheral.notifications().await?;
+    let Ok(notifications) = await_unless_stopped(peripheral.notifications(), stop).await else {
+        set(ConnectionState::Disconnected);
+        return Ok(());
+    };
+    let mut notifications = notifications?;
     let mut liveness = tokio::time::interval(Duration::from_secs(2));
     // Default `Burst` behavior replays every missed tick back-to-back once
     // notifications stop winning the select race for a while, which would
@@ -663,7 +697,12 @@ async fn stream_session(
     let device_info_char = characteristic(peripheral, CHAR_DEVICE_INFO).await?;
     let mut stitchers: std::collections::HashMap<Uuid, Stitcher> = Default::default();
 
-    peripheral.subscribe(&device_info_char).await?;
+    let Ok(subscribed) = await_unless_stopped(peripheral.subscribe(&device_info_char), stop).await
+    else {
+        set(ConnectionState::Disconnected);
+        return Ok(());
+    };
+    subscribed?;
     match tokio::time::timeout(DEVICE_INFO_TIMEOUT, async {
         let mut configured = false;
         while !configured {
@@ -714,9 +753,12 @@ async fn stream_session(
         CHAR_FOCUS,
         CHAR_SIGNAL_QUALITY,
     ] {
-        peripheral
-            .subscribe(&characteristic(peripheral, uuid).await?)
-            .await?;
+        let target = characteristic(peripheral, uuid).await?;
+        let Ok(subscribed) = await_unless_stopped(peripheral.subscribe(&target), stop).await else {
+            set(ConnectionState::Disconnected);
+            return Ok(());
+        };
+        subscribed?;
     }
 
     set(ConnectionState::Streaming);
@@ -850,5 +892,50 @@ mod tests {
         let started = Instant::now();
         request_stop_and_join(&stop, handle, Duration::from_millis(50)).await;
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_stop_aborts_then_awaits_completion_before_returning() {
+        let (stop, _rx) = Stop::pair();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let handle = tokio::spawn({
+            let order = order.clone();
+            async move {
+                struct OnDrop(Arc<Mutex<Vec<&'static str>>>);
+                impl Drop for OnDrop {
+                    fn drop(&mut self) {
+                        self.0.lock().expect("order").push("task_dropped");
+                    }
+                }
+                let _guard = OnDrop(order);
+                std::future::pending::<()>().await;
+            }
+        });
+        request_stop_and_join(&stop, handle, Duration::from_millis(20)).await;
+        order.lock().expect("order").push("joined");
+        assert_eq!(
+            order.lock().expect("order").as_slice(),
+            ["task_dropped", "joined"]
+        );
+    }
+
+    #[tokio::test]
+    async fn await_unless_stopped_cancels_pending_work() {
+        let (stop, rx) = Stop::pair();
+        let wait =
+            tokio::spawn(
+                async move { await_unless_stopped(std::future::pending::<()>(), &rx).await },
+            );
+        stop.request();
+        let result = tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("stop should cancel pending work")
+            .expect("task should not panic");
+        assert!(matches!(result, Err(SessionStopped)));
+    }
+
+    #[test]
+    fn join_timeout_outlasts_disconnect_timeout() {
+        assert!(JOIN_TIMEOUT > DISCONNECT_TIMEOUT);
     }
 }

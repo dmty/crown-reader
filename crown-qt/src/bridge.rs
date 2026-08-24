@@ -661,8 +661,10 @@ impl qobject::CrownBridge {
             }
         };
 
-        if stale_account.is_some() {
-            self.as_mut().stop_session();
+        if stale_account.is_some() && !self.as_mut().stop_session() {
+            self.as_mut()
+                .set_settingserror(QString::from("failed to stop the active session"));
+            return false;
         }
 
         if let Err(error) = stale_account
@@ -685,7 +687,11 @@ impl qobject::CrownBridge {
     }
 
     pub fn clear_auth(mut self: Pin<&mut Self>) -> bool {
-        self.as_mut().stop_session();
+        if !self.as_mut().stop_session() {
+            self.as_mut()
+                .set_settingserror(QString::from("failed to stop the active session"));
+            return false;
+        }
 
         let loaded = self.profile_store.load();
         let raw = match &loaded {
@@ -738,32 +744,46 @@ impl qobject::CrownBridge {
         self.as_mut().set_settingserror(QString::from(""));
     }
 
-    fn stop_session(mut self: Pin<&mut Self>) {
+    fn stop_session(mut self: Pin<&mut Self>) -> bool {
         let (stop, handle) = {
             let mut rust = self.as_mut().rust_mut();
             (rust.session_stop.take(), rust.handle.take())
         };
-        match (stop, handle) {
+        let joined = match (stop, handle) {
             (Some(stop), Some(handle)) => {
                 if let Some(runtime) = self.runtime.as_ref() {
                     runtime.block_on(crown_core::ble::request_stop_and_join(
                         &stop,
                         handle,
-                        crown_core::ble::DISCONNECT_TIMEOUT,
+                        crown_core::ble::JOIN_TIMEOUT,
                     ));
+                    true
                 } else {
                     handle.abort();
+                    false
                 }
             }
-            (_, Some(handle)) => handle.abort(),
-            _ => {}
-        }
+            (_, Some(handle)) => {
+                if let Some(runtime) = self.runtime.as_ref() {
+                    handle.abort();
+                    runtime.block_on(async {
+                        let _ = handle.await;
+                    });
+                    true
+                } else {
+                    handle.abort();
+                    false
+                }
+            }
+            _ => true,
+        };
         *crown_core::sync::lock(&self.recorder) = None;
         let mut live = crown_core::sync::lock(&self.live);
         live.connection = ConnectionState::Disconnected;
         live.recording = None;
         live.raw_enabled = false;
         live.touch();
+        joined
     }
 }
 
