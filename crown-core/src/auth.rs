@@ -305,10 +305,55 @@ fn reclassify_by_status(err: AuthError, status: reqwest::StatusCode) -> AuthErro
     }
 }
 
-async fn sign_in(creds: &Credentials, client: &reqwest::Client) -> Result<SignIn, AuthError> {
+fn user_devices_url(local_id: &str) -> String {
+    format!("{DATABASE_URL}/users/{local_id}/devices.json")
+}
+
+fn device_info_url(device_id: &str) -> String {
+    format!("{DATABASE_URL}/devices/{device_id}/info.json")
+}
+
+fn auth_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .expect("reqwest client with a timeout is always buildable")
+}
+
+async fn rtdb_get(
+    client: &reqwest::Client,
+    url: &str,
+    id_token: &str,
+) -> Result<String, AuthError> {
+    let response = client
+        .get(url)
+        .query(&[("auth", id_token)])
+        .send()
+        .await
+        .map_err(|e| AuthError::Http(e.to_string()))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| AuthError::Http(e.to_string()))?;
+    if !status.is_success() {
+        let err = rtdb_remote_error(
+            &serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+        )
+        .unwrap_or_else(|| AuthError::Malformed(format!("HTTP {status}")));
+        return Err(reclassify_by_status(err, status));
+    }
+    Ok(text)
+}
+
+async fn sign_in_email_password(
+    email: &str,
+    password: &str,
+    client: &reqwest::Client,
+) -> Result<SignIn, AuthError> {
     let body = serde_json::json!({
-        "email": creds.email,
-        "password": creds.password,
+        "email": email,
+        "password": password,
         "returnSecureToken": true,
     });
     let response = client
@@ -325,14 +370,40 @@ async fn sign_in(creds: &Credentials, client: &reqwest::Client) -> Result<SignIn
     parse_sign_in(&text).map_err(|e| reclassify_by_status(e, status))
 }
 
+async fn sign_in(creds: &Credentials, client: &reqwest::Client) -> Result<SignIn, AuthError> {
+    sign_in_email_password(&creds.email, &creds.password, client).await
+}
+
+pub async fn list_claimed_devices(
+    email: &str,
+    password: &str,
+) -> Result<Vec<ClaimedDevice>, AuthError> {
+    let client = auth_client();
+    let sign_in = sign_in_email_password(email, password, &client).await?;
+    let body = rtdb_get(
+        &client,
+        &user_devices_url(&sign_in.local_id),
+        &sign_in.id_token,
+    )
+    .await?;
+    let refs = parse_user_devices(&body)?;
+    let mut devices = Vec::new();
+    for device_ref in refs {
+        let info_body = rtdb_get(
+            &client,
+            &device_info_url(&device_ref.device_id),
+            &sign_in.id_token,
+        )
+        .await?;
+        if let Some(device) = parse_device_info(&info_body, &device_ref.device_id)? {
+            devices.push(device);
+        }
+    }
+    Ok(devices)
+}
+
 pub async fn mint_token(creds: &Credentials) -> Result<String, AuthError> {
-    // A server that accepts the connection and never responds must not hang
-    // the caller forever; an auth round-trip has no legitimate reason to run
-    // longer than this.
-    let client = reqwest::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .expect("reqwest client with a timeout is always buildable");
+    let client = auth_client();
     let sign_in = sign_in(creds, &client).await?;
     let body = serde_json::json!({ "data": { "deviceId": creds.device_id } });
     let response = client
@@ -525,6 +596,18 @@ mod tests {
     }
 
     #[test]
+    fn claimed_device_urls_match_neurosity_rtdb_paths() {
+        assert_eq!(
+            user_devices_url("uid-1"),
+            "https://neurosity-device.firebaseio.com/users/uid-1/devices.json"
+        );
+        assert_eq!(
+            device_info_url("abc"),
+            "https://neurosity-device.firebaseio.com/devices/abc/info.json"
+        );
+    }
+
+    #[test]
     fn memory_store_round_trips_and_clears() {
         let store = MemoryStore::default();
         assert!(store.load().is_none());
@@ -541,5 +624,19 @@ mod tests {
         let token = mint_token(&creds).await.expect("mint should succeed");
         assert!(!token.is_empty());
         println!("token length: {}", token.len());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network and real credentials"]
+    async fn live_list_returns_claimed_devices() {
+        let creds = Credentials::from_env().expect("credentials in environment");
+        let devices = list_claimed_devices(&creds.email, &creds.password)
+            .await
+            .expect("list should succeed");
+        assert!(
+            devices.iter().any(|d| d.device_id == creds.device_id),
+            "expected env device id in {:?}",
+            devices.iter().map(|d| d.device_id.as_str()).collect::<Vec<_>>()
+        );
     }
 }
