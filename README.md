@@ -17,12 +17,7 @@ Core knows nothing about Qt, so the UI layer is replaceable.
 - Qt 6 on `PATH` — `crown-qt` only; `crown-core` builds without it
 - A Neurosity account and a paired headset
 
-The GUI opens Settings when no auth profile exists in the keyring, and stores
-the profile there. After email and password, **Load devices** lists claimed
-headsets; pick one instead of pasting a device ID. `crown-cli` still reads
-`NEUROSITY_EMAIL`, `NEUROSITY_PASSWORD`, and `NEUROSITY_DEVICE_ID` from the
-environment or a `.env` file (working directory or any parent; exported shell
-variables win; `.env` is gitignored):
+The GUI opens Settings when no auth profile exists in the keyring, and stores the profile there. **Load devices** picks a headset; `crown-cli` still reads `NEUROSITY_EMAIL`, `NEUROSITY_PASSWORD`, and `NEUROSITY_DEVICE_ID` from the environment or a `.env` file (working directory or any parent; exported shell variables win; `.env` is gitignored):
 
 ```bash
 cp .env.example .env   # then fill in NEUROSITY_EMAIL, NEUROSITY_PASSWORD, NEUROSITY_DEVICE_ID
