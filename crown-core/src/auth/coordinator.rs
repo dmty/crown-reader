@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use super::provider::{AuthProvider, PasswordAuthProvider};
-use super::{cache_token, cached_token, AuthError, AuthProfile, KeyringStore, TokenStore};
+use super::{AuthError, AuthProfile, KeyringStore, TokenStore};
 
 pub struct TokenCoordinator {
     provider: Arc<dyn AuthProvider>,
@@ -20,11 +20,15 @@ impl TokenCoordinator {
     }
 
     pub async fn token(&self, force_refresh: bool) -> Result<String, AuthError> {
-        if let Some(t) = cached_token(self.store.as_ref(), force_refresh) {
-            return Ok(t);
+        if !force_refresh {
+            if let Some(t) = self.store.load() {
+                return Ok(t);
+            }
         }
         let t = self.provider.mint_ble_token().await?;
-        cache_token(self.store.as_ref(), &t);
+        if let Err(e) = self.store.save(&t) {
+            eprintln!("warning: could not cache Bluetooth token: {e}");
+        }
         Ok(t)
     }
 

@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crown_core::auth::{Credentials, KeyringStore};
+use crown_core::auth::{AuthProfile, Credentials, TokenCoordinator};
 use crown_core::backoff;
 use crown_core::state::Live;
 
@@ -14,22 +14,26 @@ async fn main() {
 
     let raw_enabled = std::env::args().any(|a| a == "--raw");
     let creds = match Credentials::from_env() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("session failed: {e:#}");
+        Ok(credentials) => credentials,
+        Err(error) => {
+            eprintln!("session failed: {error:#}");
             std::process::exit(1);
         }
     };
-    let store = Arc::new(KeyringStore {
-        account: creds.email.clone(),
-    });
+    let profile = match AuthProfile::password(creds.email, creds.password, creds.device_id) {
+        Ok(profile) => profile,
+        Err(error) => {
+            eprintln!("session failed: {error}");
+            std::process::exit(1);
+        }
+    };
+    let auth = Arc::new(TokenCoordinator::from_profile(profile));
     let live = Arc::new(Mutex::new(Live::new()));
     let recorder = Arc::new(Mutex::new(None));
 
     let worker = tokio::spawn({
         let live = live.clone();
-        let store = store.clone();
-        async move { backoff::supervise(live, creds, store, raw_enabled, recorder).await }
+        async move { backoff::supervise(live, auth, raw_enabled, recorder).await }
     });
 
     let started = Instant::now();

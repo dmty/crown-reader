@@ -248,36 +248,6 @@ pub async fn mint_token(creds: &Credentials) -> Result<String, AuthError> {
     parse_token_response(&text).map_err(|e| reclassify_by_status(e, status))
 }
 
-/// Caching is an optimization; a broken store must not fail a successful mint.
-fn cache_token(store: &dyn TokenStore, token: &str) {
-    if let Err(e) = store.save(token) {
-        eprintln!("warning: could not cache Bluetooth token: {e}");
-    }
-}
-
-/// A forced refresh must not read the cache at all, not even to discard it.
-fn cached_token(store: &dyn TokenStore, force_refresh: bool) -> Option<String> {
-    if force_refresh {
-        None
-    } else {
-        store.load()
-    }
-}
-
-/// Returns a cached token when one exists, otherwise mints and caches a new one.
-pub async fn token(
-    creds: &Credentials,
-    store: &dyn TokenStore,
-    force_refresh: bool,
-) -> Result<String, AuthError> {
-    if let Some(t) = cached_token(store, force_refresh) {
-        return Ok(t);
-    }
-    let t = mint_token(creds).await?;
-    cache_token(store, &t);
-    Ok(t)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

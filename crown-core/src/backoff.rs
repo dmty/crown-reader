@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::auth::{AuthError, Credentials, TokenStore};
+use crate::auth::{AuthError, TokenCoordinator};
 use crate::ble::DeviceRejectedToken;
 use crate::record::Recorder;
 use crate::state::{ConnectionState, Live};
@@ -71,7 +71,7 @@ const MIN_STREAMING_FOR_RESET: Duration = Duration::from_secs(10);
 ///   explain, or one of the reclassified 429/5xx cases above. The
 ///   underlying condition can resolve on its own. Transient.
 /// - `Store`: a token-cache read/write failure. Not actually reachable
-///   through `token()` today — `TokenStore::load`/`save` failures are
+///   through `TokenCoordinator::token` today — `TokenStore::load`/`save` failures are
 ///   swallowed to a warning before they become an `AuthError` a caller
 ///   sees — but if that ever changes: it describes local system state
 ///   (locked keychain, a permissions hiccup), which can clear up without
@@ -133,8 +133,7 @@ fn error_is_terminal(err: &anyhow::Error) -> bool {
 /// picture regardless of which failure path ended the session.
 pub async fn supervise(
     live: Arc<Mutex<Live>>,
-    creds: Credentials,
-    store: Arc<dyn TokenStore>,
+    auth: Arc<TokenCoordinator>,
     raw_enabled: bool,
     recorder: Arc<Mutex<Option<Recorder>>>,
 ) -> anyhow::Result<()> {
@@ -174,7 +173,7 @@ pub async fn supervise(
     // UDP port it holds -- across sessions otherwise.
     let _osc = raw_enabled.then(|| {
         let live = live.clone();
-        let device_id = creds.device_id.clone();
+        let device_id = auth.device_id().to_owned();
         let recorder = recorder.clone();
         AbortOnDrop(tokio::spawn(async move {
             let live_on_err = live.clone();
@@ -201,21 +200,8 @@ pub async fn supervise(
 
     let mut attempt = 0u32;
     loop {
-        // Credentials deliberately has no Clone (it holds a password); clone
-        // field by field instead.
-        let creds_clone = Credentials {
-            email: creds.email.clone(),
-            password: creds.password.clone(),
-            device_id: creds.device_id.clone(),
-        };
-        let result = crate::ble::run(
-            &adapter,
-            live.clone(),
-            creds_clone,
-            store.clone(),
-            recorder.clone(),
-        )
-        .await;
+        let result =
+            crate::ble::run(&adapter, live.clone(), auth.clone(), recorder.clone()).await;
 
         if result.as_ref().is_err_and(error_is_terminal) {
             let mut l = crate::sync::lock(&live);

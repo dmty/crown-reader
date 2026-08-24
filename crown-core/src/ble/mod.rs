@@ -8,7 +8,7 @@ use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
 use uuid::Uuid;
 
-use crate::auth::{token, Credentials, TokenStore};
+use crate::auth::TokenCoordinator;
 use crate::record::Recorder;
 use crate::state::{ConnectionState, Live};
 use crate::stitch::Stitcher;
@@ -420,12 +420,11 @@ async fn next_or_disconnected(
 pub async fn run(
     adapter: &Adapter,
     live: Arc<Mutex<Live>>,
-    creds: Credentials,
-    store: Arc<dyn TokenStore>,
+    auth: Arc<TokenCoordinator>,
     recorder: Arc<Mutex<Option<Recorder>>>,
 ) -> Result<()> {
     let live_for_failure = live.clone();
-    let result = try_run(adapter, live, creds, store, recorder).await;
+    let result = try_run(adapter, live, auth, recorder).await;
     if result.is_err() {
         let mut l = crate::sync::lock(&live_for_failure);
         l.connection = ConnectionState::Failed;
@@ -437,8 +436,7 @@ pub async fn run(
 async fn try_run(
     adapter: &Adapter,
     live: Arc<Mutex<Live>>,
-    creds: Credentials,
-    store: Arc<dyn TokenStore>,
+    auth: Arc<TokenCoordinator>,
     recorder: Arc<Mutex<Option<Recorder>>>,
 ) -> Result<()> {
     // `streaming_since` is managed here, alongside `connection`, rather than
@@ -481,8 +479,7 @@ async fn try_run(
     // allowed to replace the real result from `stream_session`; `run`'s
     // caller needs that result to classify the failure and decide whether
     // to retry.
-    let result =
-        stream_session(&peripheral, live.clone(), creds, store, recorder, &set).await;
+    let result = stream_session(&peripheral, live.clone(), auth, recorder, &set).await;
     match tokio::time::timeout(DISCONNECT_TIMEOUT, peripheral.disconnect()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => eprintln!("warning: failed to disconnect from the headset: {e}"),
@@ -502,8 +499,7 @@ async fn try_run(
 async fn stream_session(
     peripheral: &Peripheral,
     live: Arc<Mutex<Live>>,
-    creds: Credentials,
-    store: Arc<dyn TokenStore>,
+    auth: Arc<TokenCoordinator>,
     recorder: Arc<Mutex<Option<Recorder>>>,
     // `Send + Sync` on the trait object, not just the underlying closure: a
     // bare `dyn Fn(ConnectionState)` erases that the closure only captures a
@@ -517,7 +513,7 @@ async fn stream_session(
     dump_gatt(peripheral);
 
     set(ConnectionState::Authenticating);
-    let mut jwt = token(&creds, store.as_ref(), false).await?;
+    let mut jwt = auth.token(false).await?;
     let mut retried = false;
     loop {
         match authenticate(peripheral, &jwt).await? {
@@ -533,10 +529,10 @@ async fn stream_session(
             }
             AuthOutcome::Rejected if !retried => {
                 // A cached token can outlive its validity; mint once more, then give up.
-                if let Err(error) = store.clear() {
-                    eprintln!("warning: could not clear cached Bluetooth token: {error}");
+                if let Err(error) = auth.clear_cache() {
+                    eprintln!("warning: could not clear rejected Bluetooth token: {error}");
                 }
-                jwt = token(&creds, store.as_ref(), true).await?;
+                jwt = auth.token(true).await?;
                 retried = true;
             }
             AuthOutcome::Rejected => {
