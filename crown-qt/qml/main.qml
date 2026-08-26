@@ -4,12 +4,30 @@ import QtQuick.Layouts
 import com.crownreader.app
 
 ApplicationWindow {
-    width: 900
-    height: 600
+    id: window
+
+    width: 1280
+    height: 760
+    minimumWidth: 720
+    minimumHeight: 560
     visible: true
     title: "Crown Reader"
+    color: colors.deepField
 
     property bool showingSettings: false
+
+    AppPalette { id: colors }
+
+    palette.window: colors.deepField
+    palette.windowText: colors.readout
+    palette.base: colors.panelRaised
+    palette.alternateBase: colors.panel
+    palette.text: colors.readout
+    palette.button: colors.panelRaised
+    palette.buttonText: colors.readout
+    palette.highlight: colors.cyan
+    palette.highlightedText: colors.deepField
+    palette.placeholderText: colors.quiet
 
     function openSettings() {
         if (showingSettings)
@@ -19,14 +37,12 @@ ApplicationWindow {
         showingSettings = true
     }
 
-    CrownBridge {
-        id: crown
-    }
+    CrownBridge { id: crown }
 
     Action {
         id: settingsAction
         text: qsTr("Settings…")
-        onTriggered: openSettings()
+        onTriggered: window.openSettings()
     }
 
     Shortcut {
@@ -46,174 +62,24 @@ ApplicationWindow {
         interval: 33
         running: true
         repeat: true
-        onTriggered: crown.tick(content.width)
+        onTriggered: crown.tick(Math.round(dashboard.waveformWidth))
     }
 
     StackLayout {
         anchors.fill: parent
-        currentIndex: showingSettings ? 1 : 0
+        currentIndex: window.showingSettings ? 1 : 0
 
-        Item {
+        Dashboard {
             id: dashboard
-
-    // Content can outgrow the window: at MAX_CHANNELS the waveform rows
-    // alone exceed a 600px window, which used to push the Connect/Record/Raw
-    // buttons off-screen (Column was anchored centered, so it overflowed
-    // both ends). Scrolling keeps every control reachable at any channel
-    // count instead of capping one.
-    ScrollView {
-        anchors.fill: parent
-        clip: true
-
-        Column {
-            id: content
-            // Explicit width, not left to size from children: a Column's
-            // implicit width is the widest child's width, and a child below
-            // binds its own width to `content.width` — leaving this implicit
-            // would close that cycle into a binding loop.
-            width: Math.min(parent.width - 40, 900)
-            anchors.horizontalCenter: parent.horizontalCenter
-            y: 16
-            spacing: 12
-
-            Label { text: "Status: " + crown.connection; font.pixelSize: 20 }
-
-            // `crown.error` only ever carries a session-ending failure
-            // (`supervise` returns on a terminal error, never a transient
-            // one) so this is the one place a windowed user sees a wrong
-            // password or a missing credential — the message is otherwise
-            // only on stderr, which a Finder-launched app has no way to show.
-            Text {
-                text: crown.error === "" ? "" : "Error: " + crown.error
-                visible: crown.error !== ""
-                color: "#c04a4a"
-                font.pixelSize: 12
-                wrapMode: Text.WordWrap
-                width: content.width
-            }
-
-            Metrics {
-                id: metrics
-                bridge: crown
-                width: content.width
-            }
-
-            Repeater {
-                // `crown.rev` must be read here, not left implicit:
-                // channels() is an invokable, not a bound property, so
-                // without this read the model itself would freeze at
-                // whatever channels() returned on first evaluation (likely
-                // none, before the first successful tick) and never grow.
-                model: {
-                    crown.rev;
-                    return crown.channels();
-                }
-                Waveform {
-                    required property int index
-                    width: content.width
-                    bridge: crown
-                    channel: index
-                }
-            }
-
-            Row {
-                spacing: 8
-
-                Button {
-                    text: "Connect"
-                    onClicked: {
-                        if (!crown.configured)
-                            openSettings()
-                        else
-                            crown.start()
-                    }
-                }
-
-                Button {
-                    text: crown.recording === "" ? "Record" : "Stop"
-                    // A device must be configured before there's anything
-                    // to record against — `toggleRecording()` no-ops with
-                    // only a stderr line otherwise, which an app launched
-                    // outside a terminal (e.g. from Finder) never sees.
-                    // Once true this never goes false again (`Live.device`
-                    // is only ever replaced, never cleared), so this never
-                    // fights with an in-progress recording's "Stop" state.
-                    enabled: crown.ready
-                    onClicked: crown.toggleRecording()
-                }
-
-                Button {
-                    // Two different facts share this one property, by
-                    // session phase: idle, `crown.raw` is the pending choice
-                    // the next `start()` will use, and the label says so;
-                    // active, `tick()` overwrites it with what the transport
-                    // actually did (see bridge.rs), so the same property
-                    // reads as current status instead. `raw_enabled` is set
-                    // before the BLE state machine ever leaves `Disconnected`
-                    // (see backoff.rs), so unlike the old BLE-notification
-                    // path there is no startup window to wait out here.
-                    // "Raw: off" while active is therefore settled, but it is
-                    // two facts at once: either it was never switched on
-                    // before `start()`, or the listener failed to bind. Only
-                    // stderr separates them.
-                    text: crown.active
-                        ? (crown.raw ? "Raw: on" : "Raw: off")
-                        : (crown.raw ? "Raw (next session): on" : "Raw (next session): off")
-                    // The choice only takes effect on the session `start()`
-                    // spawns next: `supervise` reads it once, at spawn time, and
-                    // never again, so flipping it while a session is running
-                    // would silently do nothing to that session. Disabled here
-                    // rather than left clickable-but-inert.
-                    //
-                    // `crown.active` is `ConnectionState::is_active()`
-                    // republished, not a string match against `connection`:
-                    // matching against `label()`'s output here would silently
-                    // break if that mapping ever changed, with no compiler
-                    // error to catch it.
-                    enabled: !crown.active
-                    onClicked: crown.toggleRaw()
-                }
-
-                Button {
-                    text: "⚙"
-                    Accessible.name: qsTr("Settings")
-                    onClicked: settingsAction.trigger()
-                }
-            }
-
-            // "Raw: on" now means "listening on UDP" — an unconfigured
-            // device looks identical to a broken one without this.
-            Text {
-                visible: {
-                    // waveform() is an invokable, not a bound property; read
-                    // rev first so this re-evaluates when data arrives.
-                    // `ready` gates out the window before configure() has
-                    // sized the rings, so a slow deviceInfo doesn't read as
-                    // a missing device.
-                    crown.rev;
-                    return crown.raw && crown.active && crown.ready
-                        && crown.waveform(0, 100).length === 0;
-                }
-                text: "no OSC packets — enable OSC in the device settings"
-                color: "#d98a4a"
-                font.pixelSize: 11
-            }
-
-            Label {
-                text: crown.recording === "" ? "" : "Recording to " + crown.recording
-                font.pixelSize: 11
-                opacity: 0.8
-            }
-        }
-    }
-
+            bridge: crown
+            onSettingsRequested: settingsAction.trigger()
         }
 
         Settings {
             id: settings
             bridge: crown
-            onSaved: showingSettings = false
-            onCancelled: showingSettings = false
+            onSaved: window.showingSettings = false
+            onCancelled: window.showingSettings = false
         }
     }
 

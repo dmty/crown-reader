@@ -1,102 +1,208 @@
+pragma ComponentBehavior: Bound
+
 import QtQuick
-import QtQuick.Controls
 import QtQuick.Layouts
 
-ColumnLayout {
+Rectangle {
     id: root
+    objectName: "metricsPanel"
+
     required property var bridge
+    readonly property bool streaming: bridge.connection === "Streaming"
 
-    spacing: 10
+    radius: 12
+    color: colors.panel
+    border.width: 1
+    border.color: colors.instrumentLine
+    clip: true
 
-    RowLayout {
-        spacing: 24
+    AppPalette { id: colors }
+
+    ColumnLayout {
+        anchors.fill: parent
+        anchors.margins: 16
+        spacing: 0
+
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 40
+
+            Text {
+                text: qsTr("STATE")
+                color: colors.readout
+                font.family: colors.monoFont
+                font.pixelSize: 11
+                font.weight: Font.DemiBold
+                font.letterSpacing: 1.8
+            }
+
+            Item { Layout.fillWidth: true }
+
+            Rectangle {
+                Layout.preferredWidth: 6
+                Layout.preferredHeight: 6
+                radius: 3
+                color: !root.streaming
+                    ? (root.bridge.connection === "Failed" ? colors.danger
+                        : root.bridge.connection === "Reconnecting" ? colors.warning : colors.quiet)
+                    : root.bridge.staleness < 0 ? colors.quiet
+                    : root.bridge.staleness > 10000 ? colors.danger
+                    : root.bridge.staleness > 2000 ? colors.warning : colors.cyan
+            }
+
+            Text {
+                text: !root.streaming
+                    ? (root.bridge.connection === "Reconnecting" ? qsTr("RECONNECTING") : qsTr("OFFLINE"))
+                    : root.bridge.staleness < 0 ? qsTr("NO DATA")
+                    : root.bridge.staleness > 2000
+                        ? Math.round(root.bridge.staleness / 1000) + qsTr("S LATE")
+                        : qsTr("LIVE")
+                color: colors.muted
+                font.family: colors.monoFont
+                font.pixelSize: 8
+                font.letterSpacing: 0.7
+            }
+        }
+
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 1
+            color: colors.faintLine
+        }
+
         Repeater {
-            model: ["calm", "focus"]
+            model: [
+                { label: qsTr("CALM"), key: "calm", accent: colors.cyan },
+                { label: qsTr("FOCUS"), key: "focus", accent: colors.magenta }
+            ]
+
             ColumnLayout {
-                required property string modelData
-                Label { text: modelData; font.pixelSize: 12; opacity: 0.7 }
+                id: metricGauge
+                required property var modelData
+                readonly property real value: Math.max(0, Math.min(1,
+                    modelData.key === "calm" ? root.bridge.calm : root.bridge.focus))
+
+                Layout.fillWidth: true
+                Layout.topMargin: 16
+                Layout.bottomMargin: 12
+                spacing: 9
+
+                RowLayout {
+                    Layout.fillWidth: true
+
+                    Text {
+                        text: metricGauge.modelData.label
+                        color: colors.muted
+                        font.family: colors.monoFont
+                        font.pixelSize: 9
+                        font.letterSpacing: 1.2
+                    }
+
+                    Item { Layout.fillWidth: true }
+
+                    Text {
+                        text: Math.round(metricGauge.value * 100) + "%"
+                        color: colors.readout
+                        font.family: colors.monoFont
+                        font.pixelSize: 18
+                    }
+                }
+
                 Rectangle {
-                    width: 120; height: 14; radius: 7; color: "#40808080"
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 4
+                    radius: 2
+                    color: colors.faintLine
+
                     Rectangle {
-                        height: parent.height; radius: 7
-                        color: modelData === "calm" ? "#4a90d9" : "#d98a4a"
-                        width: parent.width * (modelData === "calm" ? root.bridge.calm : root.bridge.focus)
+                        width: parent.width * metricGauge.value
+                        height: parent.height
+                        radius: parent.radius
+                        color: metricGauge.modelData.accent
                     }
                 }
             }
         }
-    }
 
-    GridLayout {
-        columns: 5
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.topMargin: 4
+            Layout.preferredHeight: 1
+            color: colors.faintLine
+        }
+
+        Text {
+            Layout.topMargin: 16
+            Layout.bottomMargin: 8
+            text: qsTr("BAND POWER")
+            color: colors.readout
+            font.family: colors.monoFont
+            font.pixelSize: 9
+            font.weight: Font.DemiBold
+            font.letterSpacing: 1.3
+        }
+
         Repeater {
             model: ["delta", "theta", "alpha", "beta", "gamma"]
-            ColumnLayout {
-                required property string modelData
-                Label { text: modelData; font.pixelSize: 12; opacity: 0.7 }
-                Label {
-                    text: {
-                        root.bridge.rev; // re-read on every tick bump; band() is an invokable, not a bound property
-                        return root.bridge.band(modelData).toFixed(3);
-                    }
-                    font.family: "Menlo"
-                }
-            }
-        }
-    }
 
-    // `Layout.fillWidth` only takes effect because `root`'s own width is
-    // bound by whoever instantiates this component (see main.qml): without
-    // that, Flow has nothing to wrap against and just grows wide enough to
-    // fit every tile on one line, pushing tiles for channels above what fits
-    // off-screen instead of onto a second row.
-    Flow {
-        Layout.fillWidth: true
-        spacing: 8
-        Repeater {
-            model: {
-                root.bridge.rev; // re-read on every tick bump; channels() is an invokable, not a bound property
-                return root.bridge.channels();
-            }
-            Rectangle {
-                required property int index
+            RowLayout {
+                id: bandRow
                 required property string modelData
-                width: 78; height: 26; radius: 4
-                color: {
-                    root.bridge.rev; // re-read on every tick bump; quality() is an invokable, not a bound property
-                    const q = root.bridge.quality(index);
-                    if (q === "Great") return "#3fa34d";
-                    if (q === "Good") return "#8ab661";
-                    if (q === "Bad") return "#d98a4a";
-                    if (q === "NoContact") return "#c04a4a";
-                    return "#999999";
+                Layout.fillWidth: true
+                Layout.preferredHeight: 28
+
+                Text {
+                    text: bandRow.modelData.toUpperCase()
+                    color: colors.quiet
+                    font.family: colors.monoFont
+                    font.pixelSize: 9
+                    font.letterSpacing: 0.6
                 }
-                Label {
-                    anchors.centerIn: parent
-                    text: modelData
-                    color: "white"
+
+                Item { Layout.fillWidth: true }
+
+                Text {
+                    text: {
+                        root.bridge.rev
+                        return root.bridge.band(bandRow.modelData).toFixed(3)
+                    }
+                    color: colors.readout
+                    font.family: colors.monoFont
                     font.pixelSize: 11
                 }
             }
         }
-    }
 
-    Label {
-        text: "dropped: " + root.bridge.dropped
-        font.pixelSize: 10
-        opacity: 0.6
-    }
+        Item { Layout.fillHeight: true; Layout.minimumHeight: 8 }
 
-    // The numbers above are only as current as the stream feeding them. When
-    // raw is enabled the link cannot carry both, and calm/focus fall tens of
-    // seconds behind while still rendering as though live -- so say so on
-    // screen rather than leaving a stale score looking healthy.
-    Text {
-        readonly property int staleMs: root.bridge.staleness
-        visible: staleMs > 2000
-        text: "metrics " + (staleMs / 1000).toFixed(0) + "s behind"
-        color: staleMs > 10000 ? "#d95a4a" : "#d98a4a"
-        font.pixelSize: 11
-        font.bold: true
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 1
+            color: colors.faintLine
+        }
+
+        ColumnLayout {
+            Layout.fillWidth: true
+            Layout.topMargin: 12
+            spacing: 4
+
+            Text {
+                text: root.bridge.recording === "" ? qsTr("SESSION IDLE") : qsTr("RECORDING")
+                color: root.bridge.recording === "" ? colors.quiet : colors.magenta
+                font.family: colors.monoFont
+                font.pixelSize: 8
+                font.letterSpacing: 0.9
+            }
+
+            Text {
+                Layout.fillWidth: true
+                visible: root.bridge.recording !== ""
+                text: root.bridge.recording
+                color: colors.muted
+                font.family: colors.monoFont
+                font.pixelSize: 8
+                elide: Text.ElideMiddle
+            }
+        }
     }
 }
