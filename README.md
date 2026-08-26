@@ -36,6 +36,7 @@ The minted BLE token is cached separately in the keyring, so the app runs offlin
 cargo run -p crown-qt                        # the app
 cargo run -p crown-core --bin crown-cli      # headless, add --raw for the EEG stream
 cargo test -p crown-core                     # unit tests, no hardware needed
+qmltestrunner -input crown-qt/tests/qml -o -,txt  # QML layout and control tests
 ```
 
 Recordings are written to `~/CrownSessions/<session>/` by the app's Record button.
